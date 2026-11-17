@@ -15,7 +15,9 @@
 //! - per sheet, the order of its rows and of its columns, as movable lists of ids that never
 //!   change, so a line inserted by one person and a cell typed by another land where each meant;
 //! - each cell's entry (constant, formula or Python code) and its format, under the ids of its
-//!   row and column. Values that formulas compute are not mirrored: each copy recalculates;
+//!   row and column. Values that formulas compute are not mirrored: each copy recalculates. A
+//!   formula keeps, beside its text, the ids of the lines each of its references points at, so a
+//!   formula typed while someone else inserts or deletes lines still points where it was meant;
 //! - row heights and column widths, merged areas, notes and comments, and hyperlinks, also under
 //!   the line ids;
 //! - the sheet's other settings (conditional formats, validation, tables, filters, charts,
@@ -33,8 +35,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
+use gridcraft_core::{CellError, CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_formula::adjust::{Axis, Edit};
+use gridcraft_formula::{Expr, RefKind, Reference, SheetSel};
 use gridcraft_model::{Cell, CellStore, Comment, Formula, Hyperlink, LineInfo, PyCode, Sheet, Style, StyleId, StyleTable, Workbook};
 use loro::event::{Diff, ListDiffItem};
 use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, LoroMap, LoroMovableList, LoroValue, UndoManager, ValueOrContainer, VersionVector};
@@ -723,7 +726,7 @@ impl Collab {
         let m = &self.sheets[si];
         let key = m.cell_key(c);
         let map = self.doc.get_map(part(&m.key, "cells").as_str());
-        put(&map, &key, cell.and_then(entry))?;
+        put(&map, &key, cell.and_then(|x| self.entry_of(si, x, wb)))?;
         let style = match cell {
             Some(cell) => self.style_key(wb, cell.style)?,
             None => None,
@@ -816,10 +819,100 @@ impl Collab {
         Ok(())
     }
 
+    /// A cell's entry as the mirror keeps it; a formula with the ids of the lines its references
+    /// point at (`"a"`: per reference, in the order the parser finds them, the sheet's key and the
+    /// row and column ids of its ends).
+    fn entry_of(&self, si: usize, cell: &Cell, wb: &Workbook) -> Option<String> {
+        let Some(f) = &cell.formula else { return entry(cell) };
+        let mut anchors = Vec::new();
+        if let Ok(expr) = gridcraft_formula::parse(&f.text) {
+            expr.walk(&mut |e| {
+                if let Expr::Ref(r) = e {
+                    anchors.push(self.anchor_of(si, r, wb));
+                }
+            });
+        }
+        let json = if anchors.is_empty() { serde_json::json!({ "f": &**f }) } else { serde_json::json!({ "f": &**f, "a": anchors }) };
+        serde_json::to_string(&json).ok()
+    }
+
+    /// The sheet's key and line ids a reference points at (empty for a 3-D reference or an
+    /// unknown sheet, which are left as they are).
+    fn anchor_of(&self, si: usize, r: &Reference, wb: &Workbook) -> Vec<String> {
+        let m = match &r.sheet {
+            SheetSel::Current => self.sheets.get(si),
+            SheetSel::Named(n) => wb.sheet_index(n).and_then(|i| self.sheets.get(i)),
+            SheetSel::Span(..) => None,
+        };
+        let Some(m) = m else { return Vec::new() };
+        let mut v = vec![m.key.clone()];
+        match &r.kind {
+            RefKind::Cell(a) => v.extend([m.rows.token(a.row), m.cols.token(a.col)]),
+            RefKind::Range(a, b) => v.extend([m.rows.token(a.row), m.cols.token(a.col), m.rows.token(b.row), m.cols.token(b.col)]),
+            RefKind::Rows(r0, _, r1, _) => v.extend([m.rows.token(*r0), m.rows.token(*r1)]),
+            RefKind::Cols(c0, _, c1, _) => v.extend([m.cols.token(*c0), m.cols.token(*c1)]),
+        }
+        v
+    }
+
+    /// A formula entry with its references put where their lines are now (`#REF!` for a line
+    /// that was deleted), as plain formula text.
+    fn resolve_entry(&self, e: String) -> String {
+        if !e.contains("\"a\"") {
+            return e;
+        }
+        let Ok(mut j) = serde_json::from_str::<Json>(&e) else { return e };
+        let anchors: Vec<Vec<String>> = serde_json::from_value(j["a"].take()).unwrap_or_default();
+        if let Some(text) = j["f"]["text"].as_str()
+            && let Some(resolved) = self.resolve(text, &anchors)
+        {
+            j["f"]["text"] = Json::String(resolved);
+        }
+        if let Some(o) = j.as_object_mut() {
+            o.remove("a");
+        }
+        serde_json::to_string(&j).unwrap_or(e)
+    }
+
+    /// `text` with each reference moved to where the lines in `anchors` are now.
+    fn resolve(&self, text: &str, anchors: &[Vec<String>]) -> Option<String> {
+        let expr = gridcraft_formula::parse(text).ok()?;
+        let mut refs: Vec<Reference> = Vec::new();
+        expr.walk(&mut |e| {
+            if let Expr::Ref(r) = e {
+                refs.push(r.clone());
+            }
+        });
+        if refs.len() != anchors.len() {
+            return None;
+        }
+        let mut moved: HashMap<Reference, Expr> = HashMap::new();
+        for (r, a) in refs.iter().zip(anchors) {
+            let Some(m) = a.first().and_then(|k| self.sheets.iter().find(|m| &m.key == k)) else { continue };
+            let new = match resolve_kind(m, &r.kind, &a[1..]) {
+                Some(Some(kind)) => Expr::Ref(Reference { sheet: r.sheet.clone(), kind }),
+                Some(None) => Expr::Error(CellError::Ref),
+                None => continue,
+            };
+            moved.insert(r.clone(), new);
+        }
+        if moved.is_empty() {
+            return None;
+        }
+        let out = expr.map(&mut |e| match &e {
+            Expr::Ref(r) => moved.get(r).cloned().unwrap_or(e),
+            _ => e,
+        });
+        Some(gridcraft_formula::print(&out))
+    }
+
     fn read_cell(&self, si: usize, key: &str) -> CellSpec {
         let map = self.doc.get_map(part(&self.sheets[si].key, "cells").as_str());
         let styles = self.doc.get_map("styles");
-        CellSpec { entry: get_str(&map, key), style: get_str(&map, &format!("{key}{STYLE_SUFFIX}")).and_then(|h| get_str(&styles, &h)) }
+        CellSpec {
+            entry: get_str(&map, key).map(|e| self.resolve_entry(e)),
+            style: get_str(&map, &format!("{key}{STYLE_SUFFIX}")).and_then(|h| get_str(&styles, &h)),
+        }
     }
 
     /// Every cell of sheet `si` the mirror holds, where it is now.
@@ -1083,6 +1176,25 @@ fn set_feature(sh: &mut Sheet, f: Feature) {
         Feature::Links(links) => sh.hyperlinks = links,
         Feature::Setting(key, json) => apply_setting(sh, &key, &json),
     }
+}
+
+/// A reference's kind with its ends at the lines `tokens` name now: `None` when the tokens don't
+/// fit the kind, `Some(None)` when a line was deleted.
+fn resolve_kind(m: &SheetMirror, kind: &RefKind, tokens: &[String]) -> Option<Option<RefKind>> {
+    let row = |t: &String| m.rows.find(t);
+    let col = |t: &String| m.cols.find(t);
+    Some(match (kind, tokens) {
+        (RefKind::Cell(a), [r, c]) => (|| Some(RefKind::Cell(gridcraft_formula::Anchor { row: row(r)?, col: col(c)?, ..*a })))(),
+        (RefKind::Range(a, b), [r0, c0, r1, c1]) => (|| {
+            Some(RefKind::Range(
+                gridcraft_formula::Anchor { row: row(r0)?, col: col(c0)?, ..*a },
+                gridcraft_formula::Anchor { row: row(r1)?, col: col(c1)?, ..*b },
+            ))
+        })(),
+        (RefKind::Rows(_, a0, _, a1), [r0, r1]) => (|| Some(RefKind::Rows(row(r0)?, *a0, row(r1)?, *a1)))(),
+        (RefKind::Cols(_, a0, _, a1), [c0, c1]) => (|| Some(RefKind::Cols(col(c0)?, *a0, col(c1)?, *a1)))(),
+        _ => return None,
+    })
 }
 
 fn new_undo(doc: &LoroDoc) -> Arc<std::sync::Mutex<UndoManager>> {
@@ -1478,6 +1590,36 @@ mod tests {
     fn nothing_to_undo_before_your_first_change() {
         let (_, mut b) = pair();
         assert!(b.execute("edit.undo", json!({})).is_err());
+    }
+
+    #[test]
+    fn a_formula_typed_while_the_other_inserts_rows_points_where_it_was_meant() {
+        let (mut a, mut b) = pair();
+        set(&mut a, "A5", "1");
+        set(&mut a, "A6", "2");
+        pass(&mut a, &mut b);
+        // A inserts a row above row 1 while B sums A5:A6.
+        a.execute("home.insertRows", json!({"rows": "1:1"})).unwrap();
+        set(&mut b, "C1", "=SUM(A5:A6)");
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        for s in [&a, &b] {
+            assert_eq!(formula(s, "C2").as_deref(), Some("SUM(A6:A7)"));
+            assert_eq!(shown(s, "C2"), Value::Number(3.0));
+        }
+    }
+
+    #[test]
+    fn a_formula_on_a_row_the_other_deleted_shows_ref() {
+        let (mut a, mut b) = pair();
+        set(&mut a, "A5", "1");
+        pass(&mut a, &mut b);
+        a.execute("home.deleteRows", json!({"rows": "5:5"})).unwrap();
+        set(&mut b, "C1", "=A5*2");
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        assert_eq!(formula(&a, "C1"), formula(&b, "C1"));
+        assert!(formula(&a, "C1").is_some_and(|f| f.contains("#REF!")), "{:?}", formula(&a, "C1"));
     }
 
     #[test]
