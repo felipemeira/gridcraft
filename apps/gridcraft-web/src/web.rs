@@ -96,6 +96,9 @@ pub fn start() {
                     crate::prefs::restore(&mut app, stored_ui.as_deref(), stored_prefs.as_deref());
                     let mut prefs = crate::prefs::PrefsSync::new(stored_ui, stored_prefs);
                     SheetApp::setup_context_for_language(&cc.egui_ctx, false, app.ui.language);
+                    // Brazilian regional settings with the Portuguese interface, before the host
+                    // sends a workbook: set later, the recalculation they need would mark it changed.
+                    gridcraft_engine::core::regional::set_pt_br(app.ui.language == gridcraft_ui_egui::i18n::Language::PtBr);
                     if let Some(bridge) = &app_bridge {
                         prefs.keep_user_name(app.session.prefs.user_name.clone());
                         if let Some(author) = query_param("author") {
