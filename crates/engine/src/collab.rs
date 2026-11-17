@@ -5,22 +5,29 @@
 //! from. After each top-level command [`Collab::capture`] compares the workbook with the one the
 //! mirror last matched and writes the difference into the mirror, which hands out a small binary
 //! update for the host to pass on. An update from someone else goes through
-//! [`Collab::receive`], which turns what changed in the mirror into line inserts and deletes and
-//! cell changes, applied to the workbook as one edit (`Session::collab_receive`).
+//! [`Collab::receive`], which turns what changed in the mirror into changes of the workbook
+//! (`Session::collab_receive`).
 //!
-//! What is mirrored (prototype, stage 0):
+//! What is mirrored:
+//! - the sheets, in order, each under a key that never changes (`sheet-order`), with its name;
+//!   sheets added, renamed, moved and deleted are made again here with the sheet commands, so
+//!   formulas follow them as they do for the person who made the change;
 //! - per sheet, the order of its rows and of its columns, as movable lists of ids that never
 //!   change, so a line inserted by one person and a cell typed by another land where each meant;
 //! - each cell's entry (constant, formula or Python code) and its format, under the ids of its
-//!   row and column. Values that formulas compute are not mirrored: each copy recalculates.
+//!   row and column. Values that formulas compute are not mirrored: each copy recalculates;
+//! - row heights and column widths, merged areas, notes and comments, and hyperlinks, also under
+//!   the line ids;
+//! - the sheet's other settings (conditional formats, validation, tables, filters, charts,
+//!   pictures, shapes, frozen panes, tab colour, protection, page setup…), each as a whole: when
+//!   two people change the same one at once, the last change wins.
 //!
 //! Lines past the mirrored ones (a sheet keeps ids for its used rows and columns plus a margin)
 //! are named by their distance from the end of the list (`@3`), which inserts and deletes inside
-//! the list move just as they move the cells. Not mirrored yet: sheets added, deleted or renamed
-//! (sheets are matched by position), merges, row heights and column widths, names, comments,
-//! charts. Undo and Redo are off while co-editing: the history steps of this workbook would put
-//! back the others' changes too, so a shared workbook undoes through the mirror instead: only this
-//! person's own changes, adjusted to what the others did since ([`Collab::undo`]).
+//! the list move just as they move the cells. Not mirrored yet: defined names and other
+//! workbook-wide settings, pictures in cells. Undo and Redo of a shared workbook go through the
+//! mirror: only this person's own changes, adjusted to what the others did since
+//! ([`Collab::undo`]); the workbook's own history steps would put back the others' changes too.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -28,9 +35,9 @@ use std::sync::Arc;
 
 use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_formula::adjust::{Axis, Edit};
-use gridcraft_model::{Cell, CellStore, Formula, PyCode, Style, StyleId, StyleTable, Workbook};
+use gridcraft_model::{Cell, CellStore, Comment, Formula, Hyperlink, LineInfo, PyCode, Sheet, Style, StyleId, StyleTable, Workbook};
 use loro::event::{Diff, ListDiffItem};
-use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue, UndoManager, ValueOrContainer, VersionVector};
+use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, LoroMap, LoroMovableList, LoroValue, UndoManager, ValueOrContainer, VersionVector};
 use serde_json::Value as Json;
 
 use crate::cmd::Ctx;
@@ -42,6 +49,9 @@ const MIN_ROWS: u32 = 1000;
 /// Columns a sheet mirrors past its last used column, and at least this many in all.
 const COL_MARGIN: u32 = 20;
 const MIN_COLS: u32 = 52;
+
+/// The sheets' keys, in order.
+const SHEET_ORDER: &str = "sheet-order";
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("co-editing: {e}"))
@@ -82,11 +92,19 @@ impl Lines {
 #[derive(Clone, Debug)]
 struct SheetMirror {
     key: String,
+    /// The sheet's [`gridcraft_model::SheetUid`] here (0 until the sheet exists here).
+    uid: u64,
     rows: Lines,
     cols: Lines,
 }
 
 impl SheetMirror {
+    fn lines(&self, axis: Axis) -> &Lines {
+        match axis {
+            Axis::Rows => &self.rows,
+            Axis::Cols => &self.cols,
+        }
+    }
     fn lines_mut(&mut self, axis: Axis) -> &mut Lines {
         match axis {
             Axis::Rows => &mut self.rows,
@@ -100,17 +118,25 @@ impl SheetMirror {
         let (r, c) = key.split_once('|')?;
         Some(CellRef::new(self.rows.find(r)?, self.cols.find(c)?))
     }
-}
-
-fn lines_name(key: &str, axis: Axis) -> String {
-    match axis {
-        Axis::Rows => format!("{key}:rows"),
-        Axis::Cols => format!("{key}:cols"),
+    fn range_key(&self, r: RangeRef) -> String {
+        format!("{}|{}", self.cell_key(r.start), self.cell_key(r.end))
+    }
+    fn parse_range(&self, key: &str) -> Option<RangeRef> {
+        let parts: Vec<&str> = key.split('|').collect();
+        let [r0, c0, r1, c1] = parts.as_slice() else { return None };
+        let start = CellRef::new(self.rows.find(r0)?, self.cols.find(c0)?);
+        let end = CellRef::new(self.rows.find(r1)?, self.cols.find(c1)?);
+        Some(RangeRef::new(start, end))
     }
 }
 
-fn cells_name(key: &str) -> String {
-    format!("{key}:cells")
+/// The mirror's containers of a sheet.
+fn part(key: &str, kind: &str) -> String {
+    format!("{key}:{kind}")
+}
+
+fn lines_name(key: &str, axis: Axis) -> String {
+    part(key, if axis == Axis::Rows { "rows" } else { "cols" })
 }
 
 const STYLE_SUFFIX: &str = "|s";
@@ -142,8 +168,8 @@ fn movable_strings(list: &LoroMovableList) -> Vec<String> {
     list.to_vec().into_iter().filter_map(|v| if let LoroValue::String(s) = v { Some(s.as_str().to_owned()) } else { None }).collect()
 }
 
-fn list_strings(list: &LoroList) -> Vec<String> {
-    list.to_vec().into_iter().filter_map(|v| if let LoroValue::String(s) = v { Some(s.as_str().to_owned()) } else { None }).collect()
+fn map_keys(map: &LoroMap) -> Vec<String> {
+    map.keys().map(|k| k.to_string()).collect()
 }
 
 /// What a person entered in a cell, as the mirror keeps it: the formula, the Python code or the
@@ -160,6 +186,67 @@ fn entry(cell: &Cell) -> Option<String> {
     };
     serde_json::to_string(&json).ok()
 }
+
+/// The sheet's other settings, each mirrored as a whole (the last change wins): what is compared
+/// and written after a command, and set from the mirror when someone else changed it.
+macro_rules! sheet_settings {
+    ($($f:ident),* $(,)?) => {
+        /// The settings of `a` that differ from `b` (all of them without `b`), as JSON.
+        fn changed_settings(b: Option<&Sheet>, a: &Sheet) -> Vec<(&'static str, String)> {
+            let mut out = Vec::new();
+            $(
+                if b.is_none_or(|b| b.$f != a.$f) {
+                    match serde_json::to_string(&a.$f) {
+                        Ok(s) => out.push((stringify!($f), s)),
+                        Err(e) => log::warn!("co-editing: {}: {e}", stringify!($f)),
+                    }
+                }
+            )*
+            out
+        }
+        fn apply_setting(sh: &mut Sheet, key: &str, json: &str) {
+            match key {
+                $(
+                    stringify!($f) => match serde_json::from_str(json) {
+                        Ok(v) => sh.$f = v,
+                        Err(e) => log::warn!("co-editing: {key}: {e}"),
+                    },
+                )*
+                _ => {}
+            }
+        }
+    };
+}
+
+sheet_settings!(
+    freeze,
+    tab_color,
+    visibility,
+    show_gridlines,
+    show_headings,
+    show_formulas,
+    show_zeros,
+    show_outline_symbols,
+    summary_below,
+    summary_right,
+    right_to_left,
+    default_col_width,
+    default_row_height,
+    cond_formats,
+    validations,
+    tables,
+    autofilter,
+    charts,
+    images,
+    shapes,
+    sparklines,
+    slicers,
+    controls,
+    pivots,
+    protection,
+    edit_ranges,
+    print,
+);
 
 /// A cell as the mirror holds it: its entry and its format (as the style's JSON).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -203,23 +290,56 @@ pub struct LineChange {
     pub count: u32,
 }
 
+/// A part of a sheet someone else changed, rebuilt whole from the mirror.
+#[derive(Clone, Debug)]
+pub enum Feature {
+    Rows(BTreeMap<u32, LineInfo>),
+    Cols(BTreeMap<u32, LineInfo>),
+    Merges(Vec<RangeRef>),
+    Comments(BTreeMap<CellRef, Comment>),
+    Links(BTreeMap<CellRef, Hyperlink>),
+    /// A setting (see `sheet_settings!`) and its JSON.
+    Setting(String, String),
+}
+
+/// The sheets as someone else left them: the order of their keys, with their names and where
+/// each is here (`uid` 0 for a sheet to add), and the sheets here to delete.
+#[derive(Clone, Debug, Default)]
+pub struct SheetPlan {
+    pub deleted: Vec<u64>,
+    pub order: Vec<(String, u64, String)>,
+}
+
 /// What an update from someone else changed, in the workbook's terms.
 #[derive(Clone, Debug, Default)]
 pub struct Remote {
+    /// Sheets added, moved or deleted (applied first, with the sheet commands).
+    pub sheets: Option<SheetPlan>,
+    /// Sheets renamed (where they are after `sheets`, the new name).
+    pub renames: Vec<(usize, String)>,
     /// Line inserts and deletes, in the order they apply.
     pub lines: Vec<LineChange>,
     /// Cells to set (or clear), where they are after `lines`.
     pub cells: Vec<(usize, CellRef, CellSpec)>,
-    /// Sheets whose lines no longer matched the mirror: all their cells, rebuilt from it.
+    /// Sheets rebuilt from the mirror (new here, or whose lines no longer matched it): all their
+    /// cells.
     pub rebuilt: Vec<(usize, Vec<(CellRef, CellSpec)>)>,
+    /// Parts of sheets to set from the mirror.
+    pub features: Vec<(usize, Feature)>,
 }
 
 impl Remote {
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.cells.is_empty() && self.rebuilt.is_empty()
+        self.sheets.is_none()
+            && self.renames.is_empty()
+            && self.lines.is_empty()
+            && self.cells.is_empty()
+            && self.rebuilt.is_empty()
+            && self.features.is_empty()
     }
 
-    /// Applies the changes inside an edit.
+    /// Applies the changes to cells, lines and sheet parts inside an edit (the sheets and their
+    /// names are done before, with the sheet commands).
     pub(crate) fn apply(self, cx: &mut Ctx) -> Result<()> {
         cx.protection_checked = true;
         for l in &self.lines {
@@ -246,6 +366,22 @@ impl Remote {
             }
             cx.touch(si, c);
         }
+        for (si, feature) in self.features {
+            let sh = cx.sheet_mut(si)?;
+            match feature {
+                Feature::Rows(rows) => sh.rows = rows,
+                Feature::Cols(cols) => sh.cols = cols,
+                Feature::Merges(merges) => sh.merges = merges,
+                Feature::Comments(comments) => sh.comments = comments,
+                Feature::Links(links) => sh.hyperlinks = links,
+                Feature::Setting(key, json) => {
+                    apply_setting(sh, &key, &json);
+                    // Conditional formats, validation, tables and the like can change what
+                    // formulas and the grid show.
+                    cx.recalc_all = true;
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -266,6 +402,7 @@ pub struct Peer {
 #[derive(Clone)]
 pub struct Collab {
     doc: LoroDoc,
+    /// The sheets, in the workbook's order.
     sheets: Vec<SheetMirror>,
     /// The workbook the mirror matches.
     base: Arc<Workbook>,
@@ -287,38 +424,22 @@ impl std::fmt::Debug for Collab {
 }
 
 impl Collab {
+    fn empty(doc: LoroDoc, base: Arc<Workbook>) -> Collab {
+        let undo = new_undo(&doc);
+        Collab { sent: doc.oplog_vv(), doc, sheets: Vec::new(), base, pending: Vec::new(), outbox: Vec::new(), next_id: 0, undo }
+    }
+
     /// Starts a shared document from `wb`: the first person to open the file.
     pub fn seed(wb: Arc<Workbook>) -> Result<Collab> {
         let doc = LoroDoc::new();
-        let list = doc.get_list("sheets");
-        let mut c = Collab {
-            doc: doc.clone(),
-            sheets: Vec::new(),
-            base: wb.clone(),
-            pending: Vec::new(),
-            outbox: Vec::new(),
-            sent: VersionVector::default(),
-            next_id: 0,
-            undo: new_undo(&doc),
-        };
+        let mut c = Collab::empty(doc.clone(), wb.clone());
+        let order = doc.get_movable_list(SHEET_ORDER);
         for (i, sh) in wb.sheets.iter().enumerate() {
             let key = format!("s{i}");
-            list.push(key.as_str()).map_err(err)?;
-            let used = sh.cells.used_range();
-            let nrows = used.map_or(0, |u| u.end.row + 1).saturating_add(ROW_MARGIN).max(MIN_ROWS).min(MAX_ROWS);
-            let ncols = used.map_or(0, |u| u.end.col + 1).saturating_add(COL_MARGIN).max(MIN_COLS).min(MAX_COLS);
-            let row_ids: Vec<String> = (0..nrows).map(|r| format!("r{r}")).collect();
-            let col_ids: Vec<String> = (0..ncols).map(|k| format!("c{k}")).collect();
-            for (axis, ids) in [(Axis::Rows, &row_ids), (Axis::Cols, &col_ids)] {
-                let l = doc.get_movable_list(lines_name(&key, axis).as_str());
-                for id in ids {
-                    l.push(id.as_str()).map_err(err)?;
-                }
-            }
-            c.sheets.push(SheetMirror { key, rows: Lines::new(row_ids), cols: Lines::new(col_ids) });
-            for (cref, cell) in sh.cells.iter() {
-                c.write_cell(i, cref, Some(cell), &wb)?;
-            }
+            order.push(key.as_str()).map_err(err)?;
+            let m = c.new_sheet_mirror(key, sh)?;
+            c.sheets.push(m);
+            c.sync_sheet(i, &wb)?;
         }
         doc.commit();
         c.sent = doc.oplog_vv();
@@ -328,46 +449,56 @@ impl Collab {
     }
 
     /// Joins a shared document from its snapshot: `wb` is the same file opened here, and the
-    /// workbook returned has the shared cells in place of its own (not yet recalculated).
+    /// workbook returned has the shared sheets and cells in place of its own (not yet
+    /// recalculated). Sheets are matched by name, then (for the file's own sheets) by position.
     pub fn join(snapshot: &[u8], wb: &Workbook) -> Result<(Collab, Workbook)> {
         let doc = LoroDoc::new();
         doc.import(snapshot).map_err(err)?;
-        let keys = list_strings(&doc.get_list("sheets"));
-        if keys.len() != wb.sheets.len() {
-            return Err(EngineError::Other(format!(
-                "co-editing: the shared workbook has {} sheets and this one {}; open the same file",
-                keys.len(),
-                wb.sheets.len()
-            )));
+        let mut c = Collab::empty(doc.clone(), Arc::new(wb.clone()));
+        let keys = movable_strings(&doc.get_movable_list(SHEET_ORDER));
+        let mut out = wb.clone();
+        let mut taken: HashSet<usize> = HashSet::new();
+        let mut sheets: Vec<Arc<Sheet>> = Vec::new();
+        for key in &keys {
+            let name = get_str(&doc.get_map(part(key, "meta").as_str()), "name").unwrap_or_else(|| key.clone());
+            let by_name = wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(&name)).filter(|i| !taken.contains(i));
+            let by_place = key.strip_prefix('s').and_then(|n| n.parse::<usize>().ok()).filter(|i| *i < wb.sheets.len() && !taken.contains(i));
+            let sheet = match by_name.or(by_place) {
+                Some(i) => {
+                    taken.insert(i);
+                    let mut sh = (*wb.sheets[i]).clone();
+                    sh.name = name;
+                    sh
+                }
+                None => Sheet::new(name),
+            };
+            let rows = Lines::new(movable_strings(&doc.get_movable_list(lines_name(key, Axis::Rows).as_str())));
+            let cols = Lines::new(movable_strings(&doc.get_movable_list(lines_name(key, Axis::Cols).as_str())));
+            c.sheets.push(SheetMirror { key: key.clone(), uid: sheet.uid.get(), rows, cols });
+            sheets.push(Arc::new(sheet));
         }
-        let mut c = Collab {
-            doc: doc.clone(),
-            sheets: Vec::new(),
-            base: Arc::new(wb.clone()),
-            pending: Vec::new(),
-            outbox: Vec::new(),
-            sent: doc.oplog_vv(),
-            next_id: 0,
-            undo: new_undo(&doc),
-        };
-        for key in keys {
-            let rows = Lines::new(movable_strings(&doc.get_movable_list(lines_name(&key, Axis::Rows).as_str())));
-            let cols = Lines::new(movable_strings(&doc.get_movable_list(lines_name(&key, Axis::Cols).as_str())));
-            c.sheets.push(SheetMirror { key, rows, cols });
+        if sheets.is_empty() {
+            return Err(EngineError::Other("co-editing: the shared workbook has no sheets".into()));
         }
-        let mut wb = wb.clone();
+        out.sheets = sheets;
+        if out.active_sheet() >= out.sheets.len() {
+            out.set_active_sheet(0);
+        }
         for si in 0..c.sheets.len() {
             let mut store = CellStore::new();
             for (cref, spec) in c.all_cells(si) {
-                if let Some(cell) = spec.to_cell(&mut wb.styles) {
+                if let Some(cell) = spec.to_cell(&mut out.styles) {
                     store.set(cref, cell);
                 }
             }
-            if let Some(sh) = wb.sheets.get_mut(si) {
-                Arc::make_mut(sh).cells = store;
+            let features = c.all_features(si);
+            let sh = Arc::make_mut(&mut out.sheets[si]);
+            sh.cells = store;
+            for f in features {
+                set_feature(sh, f);
             }
         }
-        Ok((c, wb))
+        Ok((c, out))
     }
 
     /// The whole shared document, for someone joining.
@@ -391,6 +522,34 @@ impl Collab {
         self.pending.clear();
     }
 
+    /// Where the sheet with this key is here now.
+    pub(crate) fn sheet_uid(&self, key: &str) -> Option<u64> {
+        self.sheets.iter().find(|m| m.key == key).map(|m| m.uid)
+    }
+
+    /// The sheet with this key now exists here as `uid` (a sheet someone else added).
+    pub(crate) fn set_sheet_uid(&mut self, key: &str, uid: u64) {
+        if let Some(m) = self.sheets.iter_mut().find(|m| m.key == key) {
+            m.uid = uid;
+        }
+    }
+
+    /// A new sheet's line lists (its used rows and columns plus a margin), in the mirror.
+    fn new_sheet_mirror(&mut self, key: String, sh: &Sheet) -> Result<SheetMirror> {
+        let used = sh.cells.used_range();
+        let nrows = used.map_or(0, |u| u.end.row + 1).saturating_add(ROW_MARGIN).max(MIN_ROWS).min(MAX_ROWS);
+        let ncols = used.map_or(0, |u| u.end.col + 1).saturating_add(COL_MARGIN).max(MIN_COLS).min(MAX_COLS);
+        let row_ids: Vec<String> = (0..nrows).map(|r| format!("r{r}")).collect();
+        let col_ids: Vec<String> = (0..ncols).map(|k| format!("c{k}")).collect();
+        for (axis, ids) in [(Axis::Rows, &row_ids), (Axis::Cols, &col_ids)] {
+            let l = self.doc.get_movable_list(lines_name(&key, axis).as_str());
+            for id in ids {
+                l.push(id.as_str()).map_err(err)?;
+            }
+        }
+        Ok(SheetMirror { key, uid: sh.uid.get(), rows: Lines::new(row_ids), cols: Lines::new(col_ids) })
+    }
+
     /// Writes what changed between the workbook the mirror matched and `after` into the mirror,
     /// and queues the update for the others.
     pub fn capture(&mut self, after: &Arc<Workbook>) -> Result<()> {
@@ -398,11 +557,12 @@ impl Collab {
             self.pending.clear();
             return Ok(());
         }
+        let fresh = self.sync_sheet_list(after)?;
         let edits = std::mem::take(&mut self.pending);
-        let mut reshaped: HashSet<usize> = HashSet::new();
+        let mut reshaped: HashSet<u64> = HashSet::new();
         for (name, e) in &edits {
-            let Some(si) = after.sheet_index(name).or_else(|| self.base.sheet_index(name)) else { continue };
-            if si >= self.sheets.len() {
+            let Some(si) = after.sheet_index(name) else { continue };
+            if si >= self.sheets.len() || fresh.contains(&self.sheets[si].uid) {
                 continue;
             }
             match *e {
@@ -410,26 +570,67 @@ impl Collab {
                 Edit::Delete { axis, at, count } => self.delete_lines(si, axis, at, count)?,
                 _ => continue,
             }
-            reshaped.insert(si);
+            reshaped.insert(self.sheets[si].uid);
         }
         let base = self.base.clone();
+        let base_by_uid: HashMap<u64, &Arc<Sheet>> = base.sheets.iter().map(|s| (s.uid.get(), s)).collect();
         for si in 0..after.sheets.len().min(self.sheets.len()) {
             let a = &after.sheets[si];
-            let b = base.sheets.get(si);
+            let uid = a.uid.get();
+            let b = base_by_uid.get(&uid).copied();
             if b.is_some_and(|b| Arc::ptr_eq(b, a)) {
                 continue;
             }
-            match b.filter(|_| !reshaped.contains(&si)) {
+            match b.filter(|_| !reshaped.contains(&uid) && !fresh.contains(&uid)) {
                 Some(b) => {
                     for c in b.cells.diff(&a.cells) {
                         self.write_cell(si, c, a.cells.get(c), after)?;
                     }
+                    self.sync_features(si, a, Some(b))?;
                 }
                 None => self.sync_sheet(si, after)?,
             }
         }
         self.base = after.clone();
         self.flush()
+    }
+
+    /// Brings the mirror's sheets in line with the workbook's (gone, moved, new and renamed
+    /// ones); the uids of the new ones.
+    fn sync_sheet_list(&mut self, after: &Workbook) -> Result<HashSet<u64>> {
+        let order = self.doc.get_movable_list(SHEET_ORDER);
+        let uids: Vec<u64> = after.sheets.iter().map(|s| s.uid.get()).collect();
+        let mut i = self.sheets.len();
+        while i > 0 {
+            i -= 1;
+            if !uids.contains(&self.sheets[i].uid) {
+                order.delete(i, 1).map_err(err)?;
+                self.sheets.remove(i);
+            }
+        }
+        let mut fresh = HashSet::new();
+        for (ai, sh) in after.sheets.iter().enumerate() {
+            let uid = sh.uid.get();
+            match self.sheets.iter().position(|m| m.uid == uid) {
+                Some(mi) if mi == ai => {}
+                Some(mi) => {
+                    order.mov(mi, ai).map_err(err)?;
+                    let m = self.sheets.remove(mi);
+                    self.sheets.insert(ai, m);
+                }
+                None => {
+                    self.next_id += 1;
+                    let key = format!("s{:x}.{}", self.doc.peer_id(), self.next_id);
+                    order.insert(ai, key.as_str()).map_err(err)?;
+                    let m = self.new_sheet_mirror(key, sh)?;
+                    self.sheets.insert(ai, m);
+                    fresh.insert(uid);
+                }
+            }
+            let meta = self.doc.get_map(part(&self.sheets[ai].key, "meta").as_str());
+            put(&meta, "name", Some(sh.name.clone()))?;
+        }
+        Ok(fresh)
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -455,10 +656,7 @@ impl Collab {
 
     fn insert_lines(&mut self, si: usize, axis: Axis, at: u32, count: u32) -> Result<()> {
         let at = at as usize;
-        let len = match axis {
-            Axis::Rows => self.sheets[si].rows.ids.len(),
-            Axis::Cols => self.sheets[si].cols.ids.len(),
-        };
+        let len = self.sheets[si].lines(axis).ids.len();
         // Past the mirrored lines the cells keep their distance from the end of the list, which
         // an insert there would not move: those lines stay unmirrored.
         if at > len {
@@ -478,10 +676,7 @@ impl Collab {
 
     fn delete_lines(&mut self, si: usize, axis: Axis, at: u32, count: u32) -> Result<()> {
         let at = at as usize;
-        let len = match axis {
-            Axis::Rows => self.sheets[si].rows.ids.len(),
-            Axis::Cols => self.sheets[si].cols.ids.len(),
-        };
+        let len = self.sheets[si].lines(axis).ids.len();
         if at >= len {
             log::warn!("co-editing: lines deleted past the shared ones ({at} >= {len}) are not shared");
             return Ok(());
@@ -513,7 +708,7 @@ impl Collab {
     fn write_cell(&self, si: usize, c: CellRef, cell: Option<&Cell>, wb: &Workbook) -> Result<()> {
         let m = &self.sheets[si];
         let key = m.cell_key(c);
-        let map = self.doc.get_map(cells_name(&m.key).as_str());
+        let map = self.doc.get_map(part(&m.key, "cells").as_str());
         put(&map, &key, cell.and_then(entry))?;
         let style = match cell {
             Some(cell) => self.style_key(wb, cell.style)?,
@@ -522,31 +717,93 @@ impl Collab {
         put(&map, &format!("{key}{STYLE_SUFFIX}"), style)
     }
 
-    /// Writes every cell of sheet `si` into the mirror and drops the entries of cells that are
-    /// gone (or whose line was deleted): after a line insert or delete.
+    /// Writes all of sheet `si` into the mirror and drops the entries of what is gone (or whose
+    /// line was deleted): for a new sheet, and after a line insert or delete.
     fn sync_sheet(&self, si: usize, wb: &Workbook) -> Result<()> {
         let Some(sh) = wb.sheets.get(si) else { return Ok(()) };
         for (c, cell) in sh.cells.iter() {
             self.write_cell(si, c, Some(cell), wb)?;
         }
         let m = &self.sheets[si];
-        let map = self.doc.get_map(cells_name(&m.key).as_str());
-        let stale: Vec<String> = map
-            .keys()
-            .map(|k| k.to_string())
-            .filter(|k| {
-                let base = k.strip_suffix(STYLE_SUFFIX).unwrap_or(k.as_str());
-                m.parse_key(base).is_none_or(|c| sh.cells.get(c).is_none())
-            })
-            .collect();
-        for k in stale {
-            map.delete(&k).map_err(err)?;
+        let map = self.doc.get_map(part(&m.key, "cells").as_str());
+        for k in map_keys(&map) {
+            let base = k.strip_suffix(STYLE_SUFFIX).unwrap_or(k.as_str());
+            if m.parse_key(base).is_none_or(|c| sh.cells.get(c).is_none()) {
+                map.delete(&k).map_err(err)?;
+            }
+        }
+        self.sync_features(si, sh, None)
+    }
+
+    /// Writes the sheet's other parts that differ from `b` (all of them without `b`).
+    fn sync_features(&self, si: usize, a: &Sheet, b: Option<&Sheet>) -> Result<()> {
+        let m = &self.sheets[si];
+        for (axis, kind, info) in [(Axis::Rows, "rowinfo", &a.rows), (Axis::Cols, "colinfo", &a.cols)] {
+            let old = b.map(|b| if axis == Axis::Rows { &b.rows } else { &b.cols });
+            if old.is_some_and(|o| o == info) {
+                continue;
+            }
+            let lines = m.lines(axis);
+            let map = self.doc.get_map(part(&m.key, kind).as_str());
+            let mut keep = HashSet::new();
+            for (i, li) in info {
+                let token = lines.token(*i);
+                put(&map, &token, serde_json::to_string(li).ok())?;
+                keep.insert(token);
+            }
+            for k in map_keys(&map) {
+                if !keep.contains(&k) {
+                    map.delete(&k).map_err(err)?;
+                }
+            }
+        }
+        if b.is_none_or(|b| b.merges != a.merges) {
+            let map = self.doc.get_map(part(&m.key, "merges").as_str());
+            let keep: HashSet<String> = a.merges.iter().map(|r| m.range_key(*r)).collect();
+            for k in &keep {
+                put(&map, k, Some("1".into()))?;
+            }
+            for k in map_keys(&map) {
+                if !keep.contains(&k) {
+                    map.delete(&k).map_err(err)?;
+                }
+            }
+        }
+        if b.is_none_or(|b| b.comments != a.comments) {
+            self.sync_cell_map(m, "notes", a.comments.iter().map(|(c, x)| (*c, serde_json::to_string(x).ok())))?;
+        }
+        if b.is_none_or(|b| b.hyperlinks != a.hyperlinks) {
+            self.sync_cell_map(m, "links", a.hyperlinks.iter().map(|(c, x)| (*c, serde_json::to_string(x).ok())))?;
+        }
+        let settings = changed_settings(b, a);
+        if !settings.is_empty() {
+            let map = self.doc.get_map(part(&m.key, "settings").as_str());
+            for (k, json) in settings {
+                put(&map, k, Some(json))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A map of things kept by cell (notes, links): writes these, drops the others.
+    fn sync_cell_map(&self, m: &SheetMirror, kind: &str, items: impl Iterator<Item = (CellRef, Option<String>)>) -> Result<()> {
+        let map = self.doc.get_map(part(&m.key, kind).as_str());
+        let mut keep = HashSet::new();
+        for (c, json) in items {
+            let k = m.cell_key(c);
+            put(&map, &k, json)?;
+            keep.insert(k);
+        }
+        for k in map_keys(&map) {
+            if !keep.contains(&k) {
+                map.delete(&k).map_err(err)?;
+            }
         }
         Ok(())
     }
 
     fn read_cell(&self, si: usize, key: &str) -> CellSpec {
-        let map = self.doc.get_map(cells_name(&self.sheets[si].key).as_str());
+        let map = self.doc.get_map(part(&self.sheets[si].key, "cells").as_str());
         let styles = self.doc.get_map("styles");
         CellSpec { entry: get_str(&map, key), style: get_str(&map, &format!("{key}{STYLE_SUFFIX}")).and_then(|h| get_str(&styles, &h)) }
     }
@@ -554,15 +811,38 @@ impl Collab {
     /// Every cell of sheet `si` the mirror holds, where it is now.
     fn all_cells(&self, si: usize) -> Vec<(CellRef, CellSpec)> {
         let m = &self.sheets[si];
-        let map = self.doc.get_map(cells_name(&m.key).as_str());
-        let keys: BTreeSet<String> = map
-            .keys()
-            .map(|k| {
-                let k: &str = &k;
-                k.strip_suffix(STYLE_SUFFIX).unwrap_or(k).to_string()
-            })
-            .collect();
+        let map = self.doc.get_map(part(&m.key, "cells").as_str());
+        let keys: BTreeSet<String> = map_keys(&map).into_iter().map(|k| k.strip_suffix(STYLE_SUFFIX).unwrap_or(&k).to_string()).collect();
         keys.into_iter().filter_map(|k| Some((m.parse_key(&k)?, self.read_cell(si, &k)))).collect()
+    }
+
+    /// One part of sheet `si` as the mirror holds it.
+    fn feature(&self, si: usize, kind: &str) -> Vec<Feature> {
+        let m = &self.sheets[si];
+        let map = self.doc.get_map(part(&m.key, kind).as_str());
+        let entries = || map_keys(&map).into_iter().filter_map(|k| get_str(&map, &k).map(|v| (k, v)));
+        match kind {
+            "rowinfo" | "colinfo" => {
+                let lines = if kind == "rowinfo" { &m.rows } else { &m.cols };
+                let info: BTreeMap<u32, LineInfo> =
+                    entries().filter_map(|(k, v)| Some((lines.find(&k)?, serde_json::from_str(&v).ok()?))).collect();
+                vec![if kind == "rowinfo" { Feature::Rows(info) } else { Feature::Cols(info) }]
+            }
+            "merges" => {
+                let mut merges: Vec<RangeRef> = map_keys(&map).iter().filter_map(|k| m.parse_range(k)).collect();
+                merges.sort_by_key(|r| (r.start.row, r.start.col));
+                vec![Feature::Merges(merges)]
+            }
+            "notes" => vec![Feature::Comments(entries().filter_map(|(k, v)| Some((m.parse_key(&k)?, serde_json::from_str(&v).ok()?))).collect())],
+            "links" => vec![Feature::Links(entries().filter_map(|(k, v)| Some((m.parse_key(&k)?, serde_json::from_str(&v).ok()?))).collect())],
+            "settings" => entries().map(|(k, v)| Feature::Setting(k, v)).collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Every part of sheet `si` the mirror holds.
+    fn all_features(&self, si: usize) -> Vec<Feature> {
+        ["rowinfo", "colinfo", "merges", "notes", "links", "settings"].iter().flat_map(|k| self.feature(si, k)).collect()
     }
 
     fn sheet_of(&self, key: &str) -> Option<usize> {
@@ -604,6 +884,31 @@ impl Collab {
         Ok(Some(remote))
     }
 
+    /// The sheets as the mirror now has them, against the mirror's list: the plan for the
+    /// workbook, and the keys of the sheets that are new here.
+    fn plan_sheets(&mut self) -> (SheetPlan, HashSet<String>) {
+        let keys = movable_strings(&self.doc.get_movable_list(SHEET_ORDER));
+        let mut old: HashMap<String, SheetMirror> = self.sheets.drain(..).map(|m| (m.key.clone(), m)).collect();
+        let mut plan = SheetPlan::default();
+        let mut fresh = HashSet::new();
+        for key in keys {
+            let name = get_str(&self.doc.get_map(part(&key, "meta").as_str()), "name").unwrap_or_else(|| key.clone());
+            let m = match old.remove(&key) {
+                Some(m) => m,
+                None => {
+                    fresh.insert(key.clone());
+                    let rows = Lines::new(movable_strings(&self.doc.get_movable_list(lines_name(&key, Axis::Rows).as_str())));
+                    let cols = Lines::new(movable_strings(&self.doc.get_movable_list(lines_name(&key, Axis::Cols).as_str())));
+                    SheetMirror { key: key.clone(), uid: 0, rows, cols }
+                }
+            };
+            plan.order.push((key, m.uid, name));
+            self.sheets.push(m);
+        }
+        plan.deleted = old.into_values().map(|m| m.uid).filter(|u| *u != 0).collect();
+        (plan, fresh)
+    }
+
     /// What changed in the mirror between two of its versions, in the workbook's terms.
     fn changes(&mut self, before: &Frontiers, after: &Frontiers) -> Result<Remote> {
         let mut remote = Remote::default();
@@ -611,12 +916,23 @@ impl Collab {
             return Ok(remote);
         }
         let batch = self.doc.diff(before, after).map_err(err)?;
+        // Sheets first: everything else is found by the sheets' keys.
+        let mut fresh = HashSet::new();
+        if batch.iter().any(|(cid, _)| matches!(cid, ContainerID::Root { name, .. } if &**name == SHEET_ORDER)) {
+            let (plan, new) = self.plan_sheets();
+            fresh = new;
+            remote.sheets = Some(plan);
+        }
         let mut cell_keys: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
+        let mut parts: BTreeSet<(usize, &'static str)> = BTreeSet::new();
         let mut moved: BTreeSet<usize> = BTreeSet::new();
         for (cid, diff) in batch.iter() {
             let ContainerID::Root { name, .. } = cid else { continue };
             let name: &str = name.as_ref();
             let Some((key, kind)) = name.rsplit_once(':') else { continue };
+            if fresh.contains(key) {
+                continue;
+            }
             let Some(si) = self.sheet_of(key) else { continue };
             match (kind, diff) {
                 ("rows" | "cols", Diff::List(items)) => {
@@ -629,6 +945,36 @@ impl Collab {
                     for k in delta.updated.keys() {
                         let k: &str = k.as_ref();
                         keys.insert(k.strip_suffix(STYLE_SUFFIX).unwrap_or(k).to_string());
+                    }
+                }
+                ("meta", Diff::Map(delta)) => {
+                    if delta.updated.contains_key("name")
+                        && let Some(n) = get_str(&self.doc.get_map(name), "name")
+                    {
+                        remote.renames.push((si, n));
+                    }
+                }
+                ("rowinfo", _) => {
+                    parts.insert((si, "rowinfo"));
+                }
+                ("colinfo", _) => {
+                    parts.insert((si, "colinfo"));
+                }
+                ("merges", _) => {
+                    parts.insert((si, "merges"));
+                }
+                ("notes", _) => {
+                    parts.insert((si, "notes"));
+                }
+                ("links", _) => {
+                    parts.insert((si, "links"));
+                }
+                ("settings", Diff::Map(delta)) => {
+                    let map = self.doc.get_map(name);
+                    for k in delta.updated.keys() {
+                        if let Some(v) = get_str(&map, k.as_ref()) {
+                            remote.features.push((si, Feature::Setting(k.to_string(), v)));
+                        }
                     }
                 }
                 _ => {}
@@ -652,6 +998,9 @@ impl Collab {
                 remote.lines.retain(|l| l.sheet != si);
                 cell_keys.remove(&si);
                 remote.rebuilt.push((si, self.all_cells(si)));
+                for kind in ["rowinfo", "colinfo", "merges", "notes", "links"] {
+                    parts.insert((si, kind));
+                }
             }
         }
         for (si, keys) in cell_keys {
@@ -659,6 +1008,20 @@ impl Collab {
                 if let Some(c) = self.sheets[si].parse_key(&k) {
                     let spec = self.read_cell(si, &k);
                     remote.cells.push((si, c, spec));
+                }
+            }
+        }
+        for (si, kind) in parts {
+            for f in self.feature(si, kind) {
+                remote.features.push((si, f));
+            }
+        }
+        // A sheet new here comes whole from the mirror.
+        for si in 0..self.sheets.len() {
+            if fresh.contains(&self.sheets[si].key) {
+                remote.rebuilt.push((si, self.all_cells(si)));
+                for f in self.all_features(si) {
+                    remote.features.push((si, f));
                 }
             }
         }
@@ -696,6 +1059,18 @@ impl Collab {
     }
 }
 
+/// Sets a part of a sheet from the mirror (on a workbook being joined).
+fn set_feature(sh: &mut Sheet, f: Feature) {
+    match f {
+        Feature::Rows(rows) => sh.rows = rows,
+        Feature::Cols(cols) => sh.cols = cols,
+        Feature::Merges(merges) => sh.merges = merges,
+        Feature::Comments(comments) => sh.comments = comments,
+        Feature::Links(links) => sh.hyperlinks = links,
+        Feature::Setting(key, json) => apply_setting(sh, &key, &json),
+    }
+}
+
 fn new_undo(doc: &LoroDoc) -> Arc<std::sync::Mutex<UndoManager>> {
     let mut u = UndoManager::new(doc);
     u.set_max_undo_steps(100);
@@ -718,13 +1093,14 @@ impl Session {
         Ok(snapshot)
     }
 
-    /// Joins a shared workbook from its snapshot. The active workbook must be the same file; its
-    /// cells are replaced by the shared ones.
+    /// Joins a shared workbook from its snapshot. The active workbook should be the same file;
+    /// its sheets and cells are replaced by the shared ones.
     pub fn collab_join(&mut self, snapshot: &[u8]) -> Result<()> {
         let d = self.doc_mut()?;
         let (mut c, mut wb) = Collab::join(snapshot, &d.wb)?;
         let mut calc = gridcraft_calc::Calc::new();
         calc.recalc_all(&mut wb);
+        let n = wb.sheets.len();
         let wb = Arc::new(wb);
         c.rebase(&wb);
         d.calc = calc;
@@ -732,6 +1108,7 @@ impl Session {
         d.saved = wb;
         d.undo.clear();
         d.redo.clear();
+        d.sheet_selections = vec![crate::Selection::default(); n];
         d.revision += 1;
         d.collab = Some(Box::new(c));
         Ok(())
@@ -742,7 +1119,99 @@ impl Session {
         let d = self.doc_mut()?;
         let Some(c) = d.collab.as_mut() else { return Err(EngineError::Other("co-editing: this workbook is not shared".into())) };
         let remote = c.receive(update)?;
+        self.collab_apply(remote)
+    }
+
+    /// Runs commands for changes someone else made (sheets added, moved, renamed, deleted)
+    /// without writing them back into the mirror, which already has them.
+    fn collab_quietly(&mut self, f: impl FnOnce(&mut Session)) {
+        self.collab_quiet = true;
+        f(self);
+        self.collab_quiet = false;
+        if let Some(d) = self.active_mut()
+            && let Some(c) = d.collab.as_mut()
+        {
+            c.rebase(&d.wb);
+        }
+    }
+
+    /// Where the sheet with this uid is in the active workbook.
+    fn sheet_at(&self, uid: u64) -> Option<usize> {
+        self.active()?.wb.sheets.iter().position(|s| s.uid.get() == uid)
+    }
+
+    /// Makes the workbook's sheets what someone else left them: deletes, adds and moves sheets
+    /// with the sheet commands, then puts this person back on the sheet they were on.
+    fn collab_apply_sheets(&mut self, plan: &SheetPlan) {
+        let Some(d) = self.active() else { return };
+        let here = d.wb.sheets.get(d.wb.active_sheet()).map(|s| s.uid.get());
+        let selection = d.selection.clone();
+        self.collab_quietly(|s| {
+            for uid in &plan.deleted {
+                if let Some(i) = s.sheet_at(*uid)
+                    && let Err(e) = s.execute("home.deleteSheet", serde_json::json!({ "sheet": i }))
+                {
+                    log::warn!("co-editing: couldn't delete a sheet: {e}");
+                }
+            }
+            for (target, (key, uid, name)) in plan.order.iter().enumerate() {
+                if *uid == 0 {
+                    // Two people adding a sheet with the same name at once: this one gets a
+                    // name of its own here (and the next change of either brings the names in line).
+                    let taken = s.active().is_some_and(|d| d.wb.sheet_index(name).is_some());
+                    let name = if taken { format!("{name} ({})", target + 1) } else { name.clone() };
+                    match s.execute("home.insertSheet", serde_json::json!({ "name": name, "before": target })) {
+                        Ok(_) => {
+                            if let Some(d) = s.active_mut()
+                                && let Some(new) = d.wb.sheets.get(target).map(|x| x.uid.get())
+                                && let Some(c) = d.collab.as_mut()
+                            {
+                                c.set_sheet_uid(key, new);
+                            }
+                        }
+                        Err(e) => log::warn!("co-editing: couldn't add sheet {name}: {e}"),
+                    }
+                } else if let Some(cur) = s.sheet_at(*uid)
+                    && cur != target
+                    && let Err(e) = s.execute("sheet.move", serde_json::json!({ "sheet": cur, "to": target }))
+                {
+                    log::warn!("co-editing: couldn't move a sheet: {e}");
+                }
+            }
+        });
+        // Adding a sheet goes to it; this person stays where they were.
+        if let Some(i) = here.and_then(|u| self.sheet_at(u))
+            && let Some(d) = self.active_mut()
+        {
+            if d.wb.active_sheet() != i {
+                Arc::make_mut(&mut d.wb).set_active_sheet(i);
+            }
+            d.selection = selection;
+            if let Some(c) = d.collab.as_mut() {
+                c.rebase(&d.wb);
+            }
+        }
+    }
+
+    /// Applies what someone else changed (or what Undo took back) to the active workbook.
+    fn collab_apply(&mut self, mut remote: Remote) -> Result<()> {
+        if let Some(plan) = remote.sheets.take() {
+            self.collab_apply_sheets(&plan);
+        }
+        let renames = std::mem::take(&mut remote.renames);
+        if !renames.is_empty() {
+            self.collab_quietly(|s| {
+                for (si, name) in renames {
+                    let same = s.active().and_then(|d| d.wb.sheets.get(si)).is_none_or(|sh| sh.name == name);
+                    if !same && let Err(e) = s.execute("sheet.rename", serde_json::json!({ "sheet": si, "name": name })) {
+                        log::warn!("co-editing: couldn't rename a sheet: {e}");
+                    }
+                }
+            });
+        }
+        let d = self.doc_mut()?;
         if remote.is_empty() {
+            d.revision += 1;
             return Ok(());
         }
         let applied = crate::cmd::commit(d, |cx| remote.apply(cx));
@@ -755,7 +1224,7 @@ impl Session {
     }
 
     /// Undo (or Redo) in a shared workbook: this person's own last `steps` changes, applied to the
-    /// workbook as an edit and sent to the others.
+    /// workbook and sent to the others.
     pub fn collab_undo(&mut self, redo: bool, steps: usize) -> Result<Json> {
         let mut done = 0;
         for _ in 0..steps.max(1) {
@@ -763,14 +1232,10 @@ impl Session {
             let Some(c) = d.collab.as_mut() else { break };
             let Some(remote) = c.undo(redo)? else { break };
             let first = remote.cells.first().map(|(si, c, _)| (*si, *c));
-            let applied = crate::cmd::commit(d, |cx| remote.apply(cx));
-            if let Some(c) = d.collab.as_mut() {
-                c.rebase(&d.wb);
-            }
-            d.revision += 1;
-            applied?;
+            self.collab_apply(remote)?;
             // The cell that changed back comes into view, as Undo shows it in Excel.
             if let Some((si, cell)) = first
+                && let Some(d) = self.active_mut()
                 && si == d.wb.active_sheet()
             {
                 d.selection = crate::Selection::at(cell);
@@ -810,13 +1275,18 @@ impl Session {
         Some((d.wb.active_sheet(), d.selection.ranges.iter().map(|r| r.a1()).collect(), d.selection.active.a1()))
     }
 
-    /// After a top-level command: what it changed goes into the mirror.
+    /// After a top-level command: what it changed goes into the mirror (unless it was someone
+    /// else's change being made here).
     pub(crate) fn collab_capture(&mut self, uid: u64) {
+        let quiet = self.collab_quiet;
         if let Some(d) = self.docs.iter_mut().find(|d| d.uid == uid)
             && let Some(c) = d.collab.as_mut()
-            && let Err(e) = c.capture(&d.wb)
         {
-            log::warn!("{e}");
+            if quiet {
+                c.rebase(&d.wb);
+            } else if let Err(e) = c.capture(&d.wb) {
+                log::warn!("{e}");
+            }
         }
     }
 }
@@ -842,9 +1312,19 @@ mod tests {
         s.doc().unwrap().wb.sheets[0].cells.get(c).map(|c| c.value.clone()).unwrap_or(Value::Empty)
     }
 
+    fn shown_on(s: &Session, sheet: &str, cell: &str) -> Value {
+        let wb = &s.doc().unwrap().wb;
+        let c = CellRef::parse(cell).unwrap();
+        wb.sheets[wb.sheet_index(sheet).unwrap()].cells.get(c).map(|c| c.value.clone()).unwrap_or(Value::Empty)
+    }
+
     fn formula(s: &Session, cell: &str) -> Option<String> {
         let c = CellRef::parse(cell).unwrap();
         s.doc().unwrap().wb.sheets[0].cells.get(c).and_then(|c| c.formula.as_ref().map(|f| f.text.clone()))
+    }
+
+    fn sheet_names(s: &Session) -> Vec<String> {
+        s.doc().unwrap().wb.sheets.iter().map(|x| x.name.clone()).collect()
     }
 
     /// Delivers what `from` has for the others to `to`.
@@ -984,5 +1464,79 @@ mod tests {
     fn nothing_to_undo_before_your_first_change() {
         let (_, mut b) = pair();
         assert!(b.execute("edit.undo", json!({})).is_err());
+    }
+
+    #[test]
+    fn sheets_added_renamed_moved_and_deleted_reach_the_other() {
+        let (mut a, mut b) = pair();
+        a.execute("home.insertSheet", json!({"name": "Nova", "before": 1})).unwrap();
+        a.execute("cell.set", json!({"cell": "Nova!A1", "input": "na nova"})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        assert_eq!(shown_on(&b, "Nova", "A1"), Value::Text("na nova".into()));
+        // B stays on the sheet it was on.
+        assert_eq!(b.doc().unwrap().wb.active_sheet(), 0);
+        // B types on the new sheet; A sees it.
+        b.execute("cell.set", json!({"cell": "Nova!B2", "input": "7"})).unwrap();
+        pass(&mut b, &mut a);
+        assert_eq!(shown_on(&a, "Nova", "B2"), Value::Number(7.0));
+        a.execute("sheet.rename", json!({"sheet": "Nova", "name": "Renomeada"})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        a.execute("sheet.move", json!({"sheet": "Renomeada", "to": 0})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        assert_eq!(sheet_names(&b)[0], "Renomeada");
+        a.execute("home.deleteSheet", json!({"sheet": "Renomeada"})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        assert_eq!(shown(&b, "A1"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn widths_merges_and_notes_reach_the_other() {
+        let (mut a, mut b) = pair();
+        a.execute("home.columnWidth", json!({"cols": "B:B", "width": 120})).unwrap();
+        a.execute("home.mergeCells", json!({"range": "D1:E2"})).unwrap();
+        a.execute("review.newNote", json!({"cell": "C3", "text": "uma nota"})).unwrap();
+        pass(&mut a, &mut b);
+        {
+            let (sa, sb) = (&a.doc().unwrap().wb.sheets[0], &b.doc().unwrap().wb.sheets[0]);
+            assert!(!sa.cols.is_empty() && !sa.merges.is_empty() && !sa.comments.is_empty());
+            assert_eq!(sb.cols, sa.cols);
+            assert_eq!(sb.merges, sa.merges);
+            assert_eq!(sb.comments.keys().collect::<Vec<_>>(), sa.comments.keys().collect::<Vec<_>>());
+        }
+        // A row inserted by B moves the merge and the note for both.
+        b.execute("home.insertRows", json!({"rows": "1:1"})).unwrap();
+        pass(&mut b, &mut a);
+        let (sa, sb) = (&a.doc().unwrap().wb.sheets[0], &b.doc().unwrap().wb.sheets[0]);
+        assert_eq!(sb.merges, sa.merges);
+        assert_eq!(sa.merges[0].start.row, 1);
+        assert_eq!(sb.comments.keys().collect::<Vec<_>>(), sa.comments.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_frozen_pane_reaches_the_other() {
+        let (mut a, mut b) = pair();
+        a.execute("view.freezeTopRow", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        assert!(a.doc().unwrap().wb.sheets[0].freeze.is_some());
+        assert_eq!(b.doc().unwrap().wb.sheets[0].freeze, a.doc().unwrap().wb.sheets[0].freeze);
+    }
+
+    #[test]
+    fn joining_after_a_sheet_was_added_takes_it_too() {
+        let mut a = session();
+        set(&mut a, "A1", "5");
+        a.collab_seed().unwrap();
+        a.execute("home.insertSheet", json!({"name": "Extra", "before": 1})).unwrap();
+        a.execute("cell.set", json!({"cell": "Extra!A1", "input": "x"})).unwrap();
+        let _ = a.collab_outbox();
+        let snapshot = a.collab_snapshot().unwrap();
+        let mut b = session();
+        b.collab_join(&snapshot).unwrap();
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        assert_eq!(shown_on(&b, "Extra", "A1"), Value::Text("x".into()));
     }
 }

@@ -571,6 +571,9 @@ pub struct Session {
     /// Verto: where the other people editing the shared workbook are ([`collab::Peer`]), for the
     /// grid to draw their selections.
     pub collab_peers: Vec<collab::Peer>,
+    /// Verto: while someone else's changes are being made here with commands, they are not
+    /// written back into the mirror.
+    pub(crate) collab_quiet: bool,
 }
 
 impl Session {
