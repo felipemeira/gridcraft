@@ -467,6 +467,7 @@ impl Collab {
         for (i, sh) in wb.sheets.iter().enumerate() {
             let key = format!("s{i}");
             order.push(key.as_str()).map_err(err)?;
+            doc.get_map(part(&key, "meta").as_str()).insert("name", sh.name.as_str()).map_err(err)?;
             let m = c.new_sheet_mirror(key, sh)?;
             c.sheets.push(m);
             c.sync_sheet(i, &wb)?;
@@ -499,14 +500,17 @@ impl Collab {
         let mut taken: HashSet<usize> = HashSet::new();
         let mut sheets: Vec<Arc<Sheet>> = Vec::new();
         for key in &keys {
-            let name = get_str(&doc.get_map(part(key, "meta").as_str()), "name").unwrap_or_else(|| key.clone());
-            let by_name = wb.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(&name)).filter(|i| !taken.contains(i));
+            let shared_name = get_str(&doc.get_map(part(key, "meta").as_str()), "name");
+            let name = shared_name.clone().unwrap_or_else(|| key.clone());
+            let by_name = shared_name.as_ref().and_then(|n| wb.sheets.iter().position(|s| s.name == *n)).filter(|i| !taken.contains(i));
             let by_place = key.strip_prefix('s').and_then(|n| n.parse::<usize>().ok()).filter(|i| *i < wb.sheets.len() && !taken.contains(i));
             let sheet = match by_name.or(by_place) {
                 Some(i) => {
                     taken.insert(i);
                     let mut sh = (*wb.sheets[i]).clone();
-                    sh.name = name;
+                    if let Some(n) = shared_name {
+                        sh.name = n;
+                    }
                     sh
                 }
                 None => Sheet::new(name),
@@ -1449,7 +1453,7 @@ impl Session {
             self.collab_quietly(|s| {
                 for (si, name) in renames {
                     let same = s.active().and_then(|d| d.wb.sheets.get(si)).is_none_or(|sh| sh.name == name);
-                    if !same && let Err(e) = s.execute("sheet.rename", serde_json::json!({ "sheet": si, "name": name })) {
+                    if !same && let Err(e) = s.execute("sheet.rename", serde_json::json!({ "sheet": si, "name": name, "exact": true })) {
                         log::warn!("co-editing: couldn't rename a sheet: {e}");
                     }
                 }
@@ -1892,6 +1896,27 @@ mod tests {
         let e = b.collab_join(&old).unwrap_err().to_string();
         assert!(e.contains("outra versão do editor"), "{e}");
         assert!(!b.collab_active());
+    }
+
+    #[test]
+    fn sheet_names_keep_their_spaces() {
+        let mut a = session();
+        a.execute("sheet.rename", json!({"sheet": 0, "name": "Dados ", "exact": true})).unwrap();
+        set(&mut a, "A1", "5");
+        a.execute("home.insertSheet", json!({"name": "Resumo", "before": 1})).unwrap();
+        a.execute("cell.set", json!({"cell": "Resumo!A1", "input": "='Dados '!A1*2"})).unwrap();
+        let snapshot = a.collab_seed().unwrap();
+        let mut b = session();
+        b.collab_join(&snapshot).unwrap();
+        assert_eq!(sheet_names(&b), vec!["Dados ".to_string(), "Resumo".to_string()]);
+        assert_eq!(shown_on(&b, "Resumo", "A1"), Value::Number(10.0));
+        // A change after joining leaves the names alone.
+        set(&mut a, "B1", "1");
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
+        a.execute("sheet.rename", json!({"sheet": 1, "name": " Resumo ", "exact": true})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(sheet_names(&b), sheet_names(&a));
     }
 
     #[test]
