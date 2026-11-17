@@ -31,6 +31,11 @@ pub(crate) fn canonical(
         let expr = formula::parse_closing_parens(body, |text| formula::parse_input(text, locale, known));
         return Ok(format!("={}", formula::print(&expr?)));
     }
+    // Brazilian typed numbers (`1.234,56`, `1,234` = 1.234) are read by the engine's typed input
+    // with the regional settings; turning the comma into a point here would read `1,234` as 1234.
+    if locale == FormulaLocale::PtBr {
+        return Ok(text.to_string());
+    }
     // Decimal-comma number entry follows the same preference, without rewriting text or dates.
     let normalized = body.trim().replace(locale.decimal_separator(), ".");
     let number = normalized.strip_suffix('%').unwrap_or(&normalized);

@@ -186,7 +186,15 @@ impl Language {
     }
 
     pub fn formula_locale(self) -> gridcraft_engine::formula::FormulaLocale {
-        if self == Self::Es { gridcraft_engine::formula::FormulaLocale::Es } else { gridcraft_engine::formula::FormulaLocale::En }
+        use gridcraft_engine::formula::FormulaLocale;
+        if self == Self::Es {
+            FormulaLocale::Es
+        } else if gridcraft_engine::core::regional::pt_br() {
+            // Brazilian settings (Verto): formulas as pt-BR Excel types them, `SOMASE(A:A;B1;C:C)`.
+            FormulaLocale::PtBr
+        } else {
+            FormulaLocale::En
+        }
     }
 
     /// Translates an interface label; untranslated labels fall back to English.
