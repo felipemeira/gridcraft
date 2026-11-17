@@ -1,5 +1,7 @@
 //! Spelling: checks text cells against the system word list (`/usr/share/dict/words` on macOS
-//! and Linux; nothing is bundled) plus a user dictionary kept in the engine preferences.
+//! and Linux; nothing is bundled) plus a user dictionary kept in the engine preferences. When a
+//! Brazilian Portuguese Hunspell dictionary is installed (`craft_proof::pt`; the web build fetches
+//! one served beside the page), words are checked and suggested with it instead.
 
 use std::collections::HashSet;
 use std::sync::OnceLock;
@@ -41,7 +43,16 @@ fn dictionary() -> &'static HashSet<String> {
     })
 }
 
+/// Whether the Portuguese Hunspell dictionary is installed, so words are checked with it.
+fn portuguese() -> bool {
+    craft_proof::pt::has_dictionary()
+}
+
 fn known(s: &Session, w: &str) -> bool {
+    if portuguese() {
+        let l = w.to_lowercase();
+        return s.prefs.user_dictionary.iter().any(|u| u.to_lowercase() == l) || craft_proof::pt::is_correct(w);
+    }
     let l = w.to_lowercase();
     let dict = dictionary();
     if dict.contains(&l) || s.prefs.user_dictionary.iter().any(|u| u.eq_ignore_ascii_case(w)) {
@@ -101,6 +112,9 @@ fn edits1(w: &str) -> Vec<String> {
 }
 
 fn suggestions(w: &str) -> Vec<String> {
+    if portuguese() {
+        return craft_proof::pt::suggest(w, 6);
+    }
     let dict = dictionary();
     let l = w.to_lowercase();
     let mut out: Vec<String> = edits1(&l).into_iter().filter(|c| dict.contains(c)).collect();
@@ -122,7 +136,7 @@ fn suggestions(w: &str) -> Vec<String> {
 }
 
 fn spelling(s: &mut Session, p: &Json) -> Result<Json> {
-    if dictionary().is_empty() {
+    if !portuguese() && dictionary().is_empty() {
         return Err(EngineError::Other("No dictionary is available on this system (GridCraft uses the system word list).".into()));
     }
     let si = target_sheet(s, p)?;
@@ -140,7 +154,8 @@ fn spelling(s: &mut Session, p: &Json) -> Result<Json> {
         let Value::Text(t) = &cell.value else { continue };
         for w in t.split(|ch: char| !(ch.is_alphabetic() || ch == '\'')) {
             let w = w.trim_matches('\'');
-            if w.chars().count() < 2 || w.chars().all(char::is_uppercase) || !w.is_ascii() {
+            // The English word list has no accented words; the Portuguese dictionary checks them.
+            if w.chars().count() < 2 || w.chars().all(char::is_uppercase) || (!w.is_ascii() && !portuguese()) {
                 continue;
             }
             if !known(s, w) {

@@ -1029,6 +1029,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "craft-proof"
+version = "0.1.0"
+source = "git+https://github.com/storytold/craft-libs?rev=bb57d422d0bc842cbde430955825553ab7b976f4#bb57d422d0bc842cbde430955825553ab7b976f4"
+dependencies = [
+ "log",
+ "miniz_oxide 0.9.1",
+ "toml",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "craft-sheet"
 version = "0.1.0"
 source = "git+https://github.com/storytold/craft-libs?rev=bb57d422d0bc842cbde430955825553ab7b976f4#bb57d422d0bc842cbde430955825553ab7b976f4"
@@ -2254,6 +2265,7 @@ version = "0.19.1"
 dependencies = [
  "craft-csv",
  "craft-gridcraft-format",
+ "craft-proof",
  "gridcraft-calc",
  "gridcraft-chart",
  "gridcraft-core",
@@ -2384,6 +2396,7 @@ dependencies = [
 name = "gridcraft-web"
 version = "0.19.1"
 dependencies = [
+ "craft-proof",
  "craft-web-api",
  "craft-web-host",
  "eframe",

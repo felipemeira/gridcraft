@@ -5,6 +5,8 @@ use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 
+mod dictionaries;
+
 const CANVAS_ID: &str = "gridcraft_canvas";
 const LOADING_ID: &str = "gridcraft_loading";
 
@@ -20,6 +22,8 @@ pub fn start() {
             log::error!("missing <canvas id=\"{CANVAS_ID}\">");
             return;
         };
+        // Spelling dictionaries the site serves (`dictionaries/`), before the first workbook.
+        dictionaries::load_all().await;
         let mut options = eframe::WebOptions::default();
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
             let default_descriptor = std::sync::Arc::clone(&setup.device_descriptor);
