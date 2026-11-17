@@ -53,6 +53,10 @@ const MIN_COLS: u32 = 52;
 /// The sheets' keys, in order.
 const SHEET_ORDER: &str = "sheet-order";
 
+/// How the mirror is laid out. Someone with a GridCraft that lays it out otherwise can't join
+/// (a page left open from before an update): they are told to reload.
+const FORMAT: i64 = 2;
+
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("co-editing: {e}"))
 }
@@ -433,6 +437,7 @@ impl Collab {
     pub fn seed(wb: Arc<Workbook>) -> Result<Collab> {
         let doc = LoroDoc::new();
         let mut c = Collab::empty(doc.clone(), wb.clone());
+        doc.get_map("format").insert("version", FORMAT).map_err(err)?;
         let order = doc.get_movable_list(SHEET_ORDER);
         for (i, sh) in wb.sheets.iter().enumerate() {
             let key = format!("s{i}");
@@ -454,6 +459,15 @@ impl Collab {
     pub fn join(snapshot: &[u8], wb: &Workbook) -> Result<(Collab, Workbook)> {
         let doc = LoroDoc::new();
         doc.import(snapshot).map_err(err)?;
+        let version = match doc.get_map("format").get("version") {
+            Some(ValueOrContainer::Value(LoroValue::I64(v))) => v,
+            _ => 1,
+        };
+        if version != FORMAT {
+            return Err(EngineError::Other(format!(
+                "A edição compartilhada foi aberta por outra versão do editor (formato {version}, esta é {FORMAT}). Feche e abra de novo a planilha em todas as janelas."
+            )));
+        }
         let mut c = Collab::empty(doc.clone(), Arc::new(wb.clone()));
         let keys = movable_strings(&doc.get_movable_list(SHEET_ORDER));
         let mut out = wb.clone();
@@ -1523,6 +1537,18 @@ mod tests {
         pass(&mut a, &mut b);
         assert!(a.doc().unwrap().wb.sheets[0].freeze.is_some());
         assert_eq!(b.doc().unwrap().wb.sheets[0].freeze, a.doc().unwrap().wb.sheets[0].freeze);
+    }
+
+    #[test]
+    fn joining_a_document_of_another_format_is_refused_with_a_message() {
+        let doc = LoroDoc::new();
+        doc.get_list("sheets").push("s0").unwrap();
+        doc.commit();
+        let old = doc.export(ExportMode::Snapshot).unwrap();
+        let mut b = session();
+        let e = b.collab_join(&old).unwrap_err().to_string();
+        assert!(e.contains("outra versão do editor"), "{e}");
+        assert!(!b.collab_active());
     }
 
     #[test]
