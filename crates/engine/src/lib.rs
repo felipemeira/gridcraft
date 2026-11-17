@@ -713,9 +713,11 @@ impl Session {
     /// Panics inside commands are caught and reported; the workbook is restored.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
-        // Verto: the history steps of a shared workbook would put back the others' changes too.
+        // Verto: the history steps of a shared workbook would put back the others' changes too; it
+        // undoes this person's own changes through its mirror instead.
         if matches!(id, "edit.undo" | "edit.redo") && self.collab_active() {
-            return Err(EngineError::Disabled(id.to_string(), "Desfazer e Refazer ainda não funcionam na edição compartilhada.".into()));
+            let steps = params.get("steps").and_then(Json::as_u64).unwrap_or(1).clamp(1, 100) as usize;
+            return self.collab_undo(id == "edit.redo", steps);
         }
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));

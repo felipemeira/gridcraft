@@ -128,11 +128,18 @@ pub fn has_doc(s: &Session) -> std::result::Result<(), String> {
 pub fn can_undo(s: &Session) -> std::result::Result<(), String> {
     has_doc(s)?;
     not_grouping(s)?;
+    // Verto: a shared workbook undoes through its mirror.
+    if let Some(c) = s.active().and_then(|d| d.collab.as_ref()) {
+        return if c.can_undo(false) { Ok(()) } else { Err("nothing to undo".into()) };
+    }
     if s.active().is_some_and(|d| !d.undo.is_empty()) { Ok(()) } else { Err("nothing to undo".into()) }
 }
 pub fn can_redo(s: &Session) -> std::result::Result<(), String> {
     has_doc(s)?;
     not_grouping(s)?;
+    if let Some(c) = s.active().and_then(|d| d.collab.as_ref()) {
+        return if c.can_undo(true) { Ok(()) } else { Err("nothing to redo".into()) };
+    }
     if s.active().is_some_and(|d| !d.redo.is_empty()) { Ok(()) } else { Err("nothing to redo".into()) }
 }
 /// Undo and Redo wait while an undo group is open on the active document (an action that spans

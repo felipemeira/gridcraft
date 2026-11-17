@@ -19,7 +19,8 @@
 //! the list move just as they move the cells. Not mirrored yet: sheets added, deleted or renamed
 //! (sheets are matched by position), merges, row heights and column widths, names, comments,
 //! charts. Undo and Redo are off while co-editing: the history steps of this workbook would put
-//! back the others' changes too.
+//! back the others' changes too, so a shared workbook undoes through the mirror instead: only this
+//! person's own changes, adjusted to what the others did since ([`Collab::undo`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -29,7 +30,7 @@ use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_formula::adjust::{Axis, Edit};
 use gridcraft_model::{Cell, CellStore, Formula, PyCode, Style, StyleId, StyleTable, Workbook};
 use loro::event::{Diff, ListDiffItem};
-use loro::{ContainerID, ExportMode, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue, ValueOrContainer, VersionVector};
+use loro::{ContainerID, ExportMode, Frontiers, LoroDoc, LoroList, LoroMap, LoroMovableList, LoroValue, UndoManager, ValueOrContainer, VersionVector};
 use serde_json::Value as Json;
 
 use crate::cmd::Ctx;
@@ -275,6 +276,8 @@ pub struct Collab {
     /// What the others have been sent (or sent us).
     sent: VersionVector,
     next_id: u64,
+    /// Undo and Redo of this person's own changes (each top-level command is one step).
+    undo: Arc<std::sync::Mutex<UndoManager>>,
 }
 
 impl std::fmt::Debug for Collab {
@@ -288,7 +291,16 @@ impl Collab {
     pub fn seed(wb: Arc<Workbook>) -> Result<Collab> {
         let doc = LoroDoc::new();
         let list = doc.get_list("sheets");
-        let mut c = Collab { doc: doc.clone(), sheets: Vec::new(), base: wb.clone(), pending: Vec::new(), outbox: Vec::new(), sent: VersionVector::default(), next_id: 0 };
+        let mut c = Collab {
+            doc: doc.clone(),
+            sheets: Vec::new(),
+            base: wb.clone(),
+            pending: Vec::new(),
+            outbox: Vec::new(),
+            sent: VersionVector::default(),
+            next_id: 0,
+            undo: new_undo(&doc),
+        };
         for (i, sh) in wb.sheets.iter().enumerate() {
             let key = format!("s{i}");
             list.push(key.as_str()).map_err(err)?;
@@ -310,6 +322,8 @@ impl Collab {
         }
         doc.commit();
         c.sent = doc.oplog_vv();
+        // The seed is where history starts: nothing before it is undone.
+        c.undo = new_undo(&doc);
         Ok(c)
     }
 
@@ -326,7 +340,16 @@ impl Collab {
                 wb.sheets.len()
             )));
         }
-        let mut c = Collab { doc: doc.clone(), sheets: Vec::new(), base: Arc::new(wb.clone()), pending: Vec::new(), outbox: Vec::new(), sent: doc.oplog_vv(), next_id: 0 };
+        let mut c = Collab {
+            doc: doc.clone(),
+            sheets: Vec::new(),
+            base: Arc::new(wb.clone()),
+            pending: Vec::new(),
+            outbox: Vec::new(),
+            sent: doc.oplog_vv(),
+            next_id: 0,
+            undo: new_undo(&doc),
+        };
         for key in keys {
             let rows = Lines::new(movable_strings(&doc.get_movable_list(lines_name(&key, Axis::Rows).as_str())));
             let cols = Lines::new(movable_strings(&doc.get_movable_list(lines_name(&key, Axis::Cols).as_str())));
@@ -553,11 +576,41 @@ impl Collab {
         let after = self.doc.state_frontiers();
         // Everything local was sent when it was made; what came in needs no sending back.
         self.sent = self.doc.oplog_vv();
+        self.changes(&before, &after)
+    }
+
+    /// Whether there is a change of this person's to undo, or an undone one to redo.
+    pub fn can_undo(&self, redo: bool) -> bool {
+        let u = self.undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if redo { u.can_redo() } else { u.can_undo() }
+    }
+
+    /// Undoes (or redoes) this person's last change, adjusted to what the others did since, and
+    /// queues it for the others. `None` when there was nothing to undo.
+    pub fn undo(&mut self, redo: bool) -> Result<Option<Remote>> {
+        let before = self.doc.state_frontiers();
+        let done = {
+            let mut u = self.undo.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if redo { u.redo() } else { u.undo() }
+        }
+        .map_err(err)?;
+        if !done {
+            return Ok(None);
+        }
+        self.doc.commit();
+        let after = self.doc.state_frontiers();
+        let remote = self.changes(&before, &after)?;
+        self.flush()?;
+        Ok(Some(remote))
+    }
+
+    /// What changed in the mirror between two of its versions, in the workbook's terms.
+    fn changes(&mut self, before: &Frontiers, after: &Frontiers) -> Result<Remote> {
         let mut remote = Remote::default();
         if before == after {
             return Ok(remote);
         }
-        let batch = self.doc.diff(&before, &after).map_err(err)?;
+        let batch = self.doc.diff(before, after).map_err(err)?;
         let mut cell_keys: BTreeMap<usize, BTreeSet<String>> = BTreeMap::new();
         let mut moved: BTreeSet<usize> = BTreeSet::new();
         for (cid, diff) in batch.iter() {
@@ -643,6 +696,12 @@ impl Collab {
     }
 }
 
+fn new_undo(doc: &LoroDoc) -> Arc<std::sync::Mutex<UndoManager>> {
+    let mut u = UndoManager::new(doc);
+    u.set_max_undo_steps(100);
+    Arc::new(std::sync::Mutex::new(u))
+}
+
 impl Session {
     /// Whether the active workbook is being edited with others.
     pub fn collab_active(&self) -> bool {
@@ -693,6 +752,37 @@ impl Session {
         }
         d.revision += 1;
         applied
+    }
+
+    /// Undo (or Redo) in a shared workbook: this person's own last `steps` changes, applied to the
+    /// workbook as an edit and sent to the others.
+    pub fn collab_undo(&mut self, redo: bool, steps: usize) -> Result<Json> {
+        let mut done = 0;
+        for _ in 0..steps.max(1) {
+            let d = self.doc_mut()?;
+            let Some(c) = d.collab.as_mut() else { break };
+            let Some(remote) = c.undo(redo)? else { break };
+            let first = remote.cells.first().map(|(si, c, _)| (*si, *c));
+            let applied = crate::cmd::commit(d, |cx| remote.apply(cx));
+            if let Some(c) = d.collab.as_mut() {
+                c.rebase(&d.wb);
+            }
+            d.revision += 1;
+            applied?;
+            // The cell that changed back comes into view, as Undo shows it in Excel.
+            if let Some((si, cell)) = first
+                && si == d.wb.active_sheet()
+            {
+                d.selection = crate::Selection::at(cell);
+            }
+            done += 1;
+        }
+        if done == 0 {
+            let id = if redo { "edit.redo" } else { "edit.undo" };
+            let why = if redo { "nothing to redo" } else { "nothing to undo" };
+            return Err(EngineError::Disabled(id.into(), why.into()));
+        }
+        Ok(serde_json::json!({ "steps": done }))
     }
 
     /// The snapshot of the active workbook's shared document, for someone joining.
@@ -845,9 +935,54 @@ mod tests {
     }
 
     #[test]
-    fn undo_is_off_while_shared() {
-        let (mut a, _) = pair();
-        set(&mut a, "A1", "1");
-        assert!(a.execute("edit.undo", json!({})).is_err());
+    fn undo_takes_back_only_your_own_change() {
+        let (mut a, mut b) = pair();
+        set(&mut a, "B1", "de A");
+        set(&mut b, "C1", "de B");
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        // A undoes: B1 goes for both, C1 (B's) stays.
+        a.execute("edit.undo", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        for s in [&a, &b] {
+            assert_eq!(shown(s, "B1"), Value::Empty);
+            assert_eq!(shown(s, "C1"), Value::Text("de B".into()));
+        }
+        // And redoes it.
+        a.execute("edit.redo", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(shown(&b, "B1"), Value::Text("de A".into()));
+    }
+
+    #[test]
+    fn undo_puts_back_the_value_before_your_change() {
+        let (mut a, mut b) = pair();
+        set(&mut a, "A1", "8");
+        pass(&mut a, &mut b);
+        a.execute("edit.undo", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        for s in [&a, &b] {
+            assert_eq!(shown(s, "A1"), Value::Number(5.0));
+            assert_eq!(shown(s, "A2"), Value::Number(10.0));
+        }
+    }
+
+    #[test]
+    fn undo_of_an_inserted_row_removes_it_for_both() {
+        let (mut a, mut b) = pair();
+        a.execute("home.insertRows", json!({"rows": "1:1"})).unwrap();
+        pass(&mut a, &mut b);
+        a.execute("edit.undo", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        for s in [&a, &b] {
+            assert_eq!(shown(s, "A1"), Value::Number(5.0));
+            assert_eq!(formula(s, "A2").as_deref(), Some("A1*2"));
+        }
+    }
+
+    #[test]
+    fn nothing_to_undo_before_your_first_change() {
+        let (_, mut b) = pair();
+        assert!(b.execute("edit.undo", json!({})).is_err());
     }
 }
