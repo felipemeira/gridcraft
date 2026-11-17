@@ -90,8 +90,43 @@ pub(crate) struct SelectionPaintInput<'a> {
     pub(crate) cols: (u32, u32),
 }
 
+/// Verto: the selections of the other people editing a shared workbook, each in their colour, with
+/// their name on their active cell (as Google Sheets shows them).
+fn paint_peers(p: &Painter, geo: &Geo, sh: &Sheet, app: &SheetApp, rows: (u32, u32), cols: (u32, u32)) {
+    let Some(doc) = app.session.active() else { return };
+    for peer in &app.session.collab_peers {
+        if doc.wb.sheets.get(peer.sheet).is_none_or(|s| s.name != sh.name) {
+            continue;
+        }
+        let [r, g, b] = peer.color;
+        let color = Color32::from_rgb(r, g, b);
+        for range in peer.ranges.iter().filter(|x| range_in_pane(**x, rows, cols)) {
+            let rect = geo.range_rect(sh, *range);
+            if range.start != range.end {
+                p.rect_filled(rect, 0.0, color.gamma_multiply(0.10));
+            }
+            for side in outline_bands(rect.expand(0.5), 2.0, p.clip_rect()) {
+                p.rect_filled(side, 0.0, color);
+            }
+        }
+        let active_range = sh.merge_at(peer.active).unwrap_or_else(|| RangeRef::cell(peer.active));
+        if !range_in_pane(active_range, rows, cols) || peer.name.is_empty() {
+            continue;
+        }
+        let cell = geo.range_rect(sh, active_range);
+        let galley = p.layout_no_wrap(peer.name.clone(), egui::FontId::proportional(10.0), Color32::WHITE);
+        let size = galley.size() + vec2(6.0, 2.0);
+        // Above the cell, or below it when there is no room above.
+        let top = if cell.top() - size.y >= geo.rect.top() { cell.top() - size.y } else { cell.bottom() };
+        let tag = Rect::from_min_size(pos2(cell.left() - 0.5, top), size);
+        p.rect_filled(tag, 2.0, color);
+        p.galley(tag.min + vec2(3.0, 1.0), galley, Color32::WHITE);
+    }
+}
+
 pub(crate) fn paint_selection(input: SelectionPaintInput<'_>) {
     let SelectionPaintInput { painter: p, geo, sheet: sh, selection: sel, outline, tokens: t, app, rows, cols } = input;
+    paint_peers(p, geo, sh, app, rows, cols);
     // Fill all areas except the active cell.
     for rect in selection_fill_where(geo, sh, sel, outline, |r| range_in_pane(*r, rows, cols)) {
         p.rect_filled(rect, 0.0, t.sel_fill);

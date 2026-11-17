@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, Value};
+use gridcraft_core::{CellRef, MAX_COLS, MAX_ROWS, RangeRef, Value};
 use gridcraft_formula::adjust::{Axis, Edit};
 use gridcraft_model::{Cell, CellStore, Formula, PyCode, Style, StyleId, StyleTable, Workbook};
 use loro::event::{Diff, ListDiffItem};
@@ -247,6 +247,18 @@ impl Remote {
         }
         Ok(())
     }
+}
+
+/// Another person editing the shared workbook: who, in what colour, and what they have selected.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peer {
+    pub id: String,
+    pub name: String,
+    pub color: [u8; 3],
+    /// The sheet they are on, by position.
+    pub sheet: usize,
+    pub ranges: Vec<RangeRef>,
+    pub active: CellRef,
 }
 
 /// The mirror of one open workbook.
@@ -698,6 +710,14 @@ impl Session {
         if let Some(d) = self.active_mut() {
             d.collab = None;
         }
+        self.collab_peers.clear();
+    }
+
+    /// Where this person is in the shared workbook, for the others: the sheet (by position), the
+    /// selected areas and the active cell. `None` when the active workbook is not shared.
+    pub fn collab_presence(&self) -> Option<(usize, Vec<String>, String)> {
+        let d = self.active().filter(|d| d.collab.is_some())?;
+        Some((d.wb.active_sheet(), d.selection.ranges.iter().map(|r| r.a1()).collect(), d.selection.active.a1()))
     }
 
     /// After a top-level command: what it changed goes into the mirror.

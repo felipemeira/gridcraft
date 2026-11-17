@@ -568,6 +568,9 @@ pub struct Session {
     /// Measures cell text for AutoFit Column Width. Without it (CLI, MCP) AutoFit uses
     /// [`cmd::format::approx_text_width`].
     pub text_width: Option<TextWidth>,
+    /// Verto: where the other people editing the shared workbook are ([`collab::Peer`]), for the
+    /// grid to draw their selections.
+    pub collab_peers: Vec<collab::Peer>,
 }
 
 impl Session {
