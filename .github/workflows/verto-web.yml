@@ -48,6 +48,8 @@ jobs:
           cargo test --locked -p gridcraft-formula --lib pt_br
       - name: Test co-editing
         run: cargo test --locked -p gridcraft-engine --lib collab
+      - name: Measure co-editing (sizes and times)
+        run: cargo test --locked --release -p gridcraft-engine --lib collab::tests::measure -- --ignored --nocapture
       - name: Build and zip
         run: packaging/web/package.sh
       - name: Add the pt_BR dictionary

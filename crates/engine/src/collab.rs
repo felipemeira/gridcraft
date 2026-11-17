@@ -1470,6 +1470,69 @@ mod tests {
         (a, b)
     }
 
+    fn millis_since(t0: std::time::Duration) -> u128 {
+        std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap_or_default().saturating_sub(t0).as_millis()
+    }
+
+    fn clock() -> std::time::Duration {
+        std::time::SystemTime::UNIX_EPOCH.elapsed().unwrap_or_default()
+    }
+
+    /// A worksheet the size of a construction schedule: 5,000 rows of 20 columns (numbers, text,
+    /// formulas, some bold). Run by CI with `--ignored --nocapture` to print the sizes and times.
+    #[test]
+    #[ignore]
+    fn measure() {
+        let mut a = session();
+        {
+            let d = a.doc_mut().unwrap();
+            let wb = Arc::make_mut(&mut d.wb);
+            let mut bold = wb.styles.get(StyleId::DEFAULT).clone();
+            bold.font.bold = true;
+            let bold = wb.styles.intern(bold);
+            let sh = wb.sheet_mut(0).unwrap();
+            for r in 0..5000u32 {
+                for c in 0..20u32 {
+                    let at = CellRef::new(r, c);
+                    let cell = match c {
+                        0 => Cell::value(Value::Text(format!("Serviço {r}").into())),
+                        1 => Cell::value(Value::Text("m²".into())),
+                        17 => Cell::formula(Formula::new(&format!("C{}*D{}", r + 1, r + 1))),
+                        18 => Cell::formula(Formula::new(&format!("SUM(C{}:Q{})", r + 1, r + 1))),
+                        19 => Cell::formula(Formula::new(&format!("SUMIF(A:A,A{},S:S)", r + 1))),
+                        _ => Cell::value(Value::Number((r * 31 + c * 7) as f64 / 3.0)),
+                    };
+                    let cell = if r % 10 == 0 { Cell { style: bold, ..cell } } else { cell };
+                    sh.cells.set(at, cell);
+                }
+            }
+            let mut wb = (*d.wb).clone();
+            d.calc.recalc_all(&mut wb);
+            d.wb = Arc::new(wb);
+            d.saved = d.wb.clone();
+        }
+        let t0 = clock();
+        let snapshot = a.collab_seed().unwrap();
+        let seed_ms = millis_since(t0);
+        let t0 = clock();
+        a.execute("home.insertRows", json!({"rows": "10:10"})).unwrap();
+        let insert_ms = millis_since(t0);
+        let update: usize = a.collab_outbox().iter().map(Vec::len).sum();
+        let t0 = clock();
+        set(&mut a, "D20", "99");
+        let typed_ms = millis_since(t0);
+        let typed: usize = a.collab_outbox().iter().map(Vec::len).sum();
+        let mut b = session();
+        let t0 = clock();
+        b.collab_join(&snapshot).unwrap();
+        let join_ms = millis_since(t0);
+        println!(
+            "MEASURE cells=100000 snapshot={} KB seed={seed_ms} ms insert_row={insert_ms} ms (update {} KB) typed={typed_ms} ms (update {typed} B) join={join_ms} ms",
+            snapshot.len() / 1024,
+            update / 1024
+        );
+    }
+
     #[test]
     fn joining_takes_the_shared_cells() {
         let (_, b) = pair();
