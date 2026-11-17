@@ -33,6 +33,9 @@ pub fn parse_input(s: &str, sys: DateSystem) -> Parsed {
     if let Some(e) = CellError::parse(t) {
         return Parsed { value: Value::Error(e), format: None };
     }
+    if let Some((n, f)) = parse_regional(t, sys) {
+        return Parsed { value: Value::number(n), format: f };
+    }
     if let Some((n, f)) = parse_numeric(t, sys) {
         return Parsed { value: Value::number(n), format: f };
     }
@@ -46,7 +49,26 @@ pub fn parse_number_text(s: &str) -> Option<f64> {
 
 /// Like [`parse_number_text`], with date text read in the given workbook date system.
 pub fn parse_number_text_in(s: &str, sys: DateSystem) -> Option<f64> {
-    parse_numeric(s.trim(), sys).map(|(n, _)| n)
+    parse_regional(s.trim(), sys).or_else(|| parse_numeric(s.trim(), sys)).map(|(n, _)| n)
+}
+
+/// With the Brazilian settings on ([`crate::regional`]), the Brazilian reading of the text
+/// (`1.234,56`, `17/11/2026`), tried before the en-US one. A day-first date that isn't a date
+/// (`3/13`) falls through to the en-US reading.
+fn parse_regional(t: &str, sys: DateSystem) -> Option<(f64, Option<&'static str>)> {
+    if !crate::regional::pt_br() {
+        return None;
+    }
+    let r = parse_numeric(&crate::regional::typed_to_invariant(t)?, sys)?;
+    // The automatic formats are Excel's en-US ones; a date typed day first keeps the day first.
+    Some(match r.1 {
+        Some("m/d/yyyy") => (r.0, Some("dd/mm/yyyy")),
+        Some("m/d/yyyy h:mm") => (r.0, Some("dd/mm/yyyy h:mm")),
+        // Typed in reais (`R$ 5,50`): the Brazilian currency format.
+        Some("\"$\"#,##0.00") if t.contains("R$") => (r.0, Some("\"R$\" #,##0.00")),
+        Some("\"$\"#,##0") if t.contains("R$") => (r.0, Some("\"R$\" #,##0")),
+        f => (r.0, f),
+    })
 }
 
 /// Text that Excel's "Number Stored as Text" check flags: it would be a number if typed (signs,

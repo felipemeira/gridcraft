@@ -158,7 +158,7 @@ pub(crate) fn render_date(sec: &Section, v: f64, sys: DateSystem) -> Option<Out>
                     DatePart::SubSec(n) => {
                         // `.` and the first `n` (at most 3) of the three millisecond digits, then
                         // zeros for the digits beyond milliseconds.
-                        text.push('.');
+                        text.push(gridcraft_core::regional::decimal_separator());
                         for (k, div) in [100, 10, 1].into_iter().enumerate() {
                             if k < n as usize {
                                 text.push(char::from(b'0' + (milli / div % 10) as u8));
@@ -279,14 +279,14 @@ fn fill_int(toks: &[Tok], idxs: &[usize], digits: &str, thousands: bool, force_z
                 '0' => {
                     parts.buf.push('0');
                     if sep(pos) {
-                        parts.buf.push(',');
+                        parts.buf.push(gridcraft_core::regional::group_separator());
                     }
                     pos += 1;
                 }
                 _ if force_zero && k == 0 => {
                     parts.buf.push('0');
                     if sep(pos) {
-                        parts.buf.push(',');
+                        parts.buf.push(gridcraft_core::regional::group_separator());
                     }
                     pos += 1;
                 }
@@ -306,7 +306,7 @@ fn fill_int(toks: &[Tok], idxs: &[usize], digits: &str, thousands: bool, force_z
                 let d = ds.get(rem.saturating_sub(1 + s)).copied().unwrap_or(b'0');
                 parts.buf.push(char::from(d));
                 if sep(pos + s) {
-                    parts.buf.push(',');
+                    parts.buf.push(gridcraft_core::regional::group_separator());
                 }
             }
             rem -= take;
@@ -324,7 +324,7 @@ fn with_commas(digits: &str, thousands: bool) -> String {
     let mut s = String::with_capacity(n + n / 3);
     for (i, c) in digits.chars().enumerate() {
         if i > 0 && (n - i).is_multiple_of(3) {
-            s.push(',');
+            s.push(gridcraft_core::regional::group_separator());
         }
         s.push(c);
     }
@@ -523,7 +523,7 @@ pub(crate) fn render_number(sec: &Section, v: f64) -> Out {
         }
         fill_frac(toks, &frac_idx, &frac_s, &mut parts);
         if let Some(p) = point {
-            parts.set_piece(p, ".");
+            parts.set_piece(p, gridcraft_core::regional::decimal_separator().encode_utf8(&mut [0; 4]));
         }
     }
     let mut out = Out::default();

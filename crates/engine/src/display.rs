@@ -79,8 +79,12 @@ pub fn edit_text(wb: &Workbook, sheet: &Sheet, c: CellRef) -> String {
     }
     let Value::Number(n) = &cell.value else { return raw };
     let code = wb.styles.get(cell.style).num_fmt.as_str();
-    if cell.formula.is_some() || !parsed(code).is_date() {
+    if cell.formula.is_some() {
         return raw;
+    }
+    if !parsed(code).is_date() {
+        // `1234,5` with the Brazilian settings, which typed input reads back.
+        return gridcraft_core::regional::localize_number_text(&raw);
     }
     let reads_back = |s: &str| matches!(gridcraft_core::parse::parse_input(s, wb.date_system).value, Value::Number(m) if (m - n).abs() < 1e-9);
     let shown = format(&cell.value, code, wb).text;

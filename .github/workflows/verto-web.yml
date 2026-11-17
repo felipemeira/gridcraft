@@ -42,6 +42,8 @@ jobs:
       - uses: storytold/craft-common-actions/actions/install-trunk@main
       - name: Check out craft-i18n
         uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - name: Test the Brazilian regional settings
+        run: cargo test --locked -p gridcraft-core --lib regional
       - name: Build and zip
         run: packaging/web/package.sh
       - name: Add the pt_BR dictionary

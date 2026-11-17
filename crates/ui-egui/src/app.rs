@@ -212,6 +212,16 @@ impl SheetApp {
         }
         // The language the widgets translate with this frame (see `i18n::current`).
         i18n::set_current(&ctx, self.ui.language);
+        // Brazilian regional settings with the Portuguese interface (Verto): decimal comma, month
+        // names in Portuguese, typed dates day first and TEXT codes as pt-BR Excel reads them
+        // (`gridcraft_core::regional`). Recalculate when they change, so TEXT results follow.
+        let pt_br = self.ui.language == i18n::Language::PtBr;
+        if gridcraft_engine::core::regional::pt_br() != pt_br {
+            gridcraft_engine::core::regional::set_pt_br(pt_br);
+            if self.session.active().is_some() {
+                let _ = self.session.execute("formulas.calculateNow", serde_json::json!({}));
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         updates_ui::show(self, &ctx);
         let t = theme::Tokens::get(&ctx);

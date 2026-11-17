@@ -8,6 +8,7 @@ pub mod color;
 pub mod date;
 pub mod parse;
 pub mod region;
+pub mod regional;
 pub mod value;
 
 pub use addr::{

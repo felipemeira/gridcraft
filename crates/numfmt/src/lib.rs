@@ -505,6 +505,14 @@ pub fn text_function(v: &Value, code: &str, sys: DateSystem) -> Result<String, C
     if too_long(code) {
         return Err(CellError::Value);
     }
+    // pt-BR Excel reads TEXT's format in its own codes (`"MMM/AA"`, `"#.##0,00"`).
+    let regional;
+    let code = if gridcraft_core::regional::pt_br() {
+        regional = gridcraft_core::regional::text_code_to_invariant(code);
+        regional.as_str()
+    } else {
+        code
+    };
     let fmt = NumberFormat::parse_cached(code);
     if fmt.inner.invalid {
         return Err(CellError::Value);
