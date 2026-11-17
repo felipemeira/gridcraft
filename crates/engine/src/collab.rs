@@ -58,7 +58,7 @@ const SHEET_ORDER: &str = "sheet-order";
 
 /// How the mirror is laid out. Someone with a GridCraft that lays it out otherwise can't join
 /// (a page left open from before an update): they are told to reload.
-const FORMAT: i64 = 2;
+const FORMAT: i64 = 3;
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("co-editing: {e}"))
@@ -179,19 +179,27 @@ fn map_keys(map: &LoroMap) -> Vec<String> {
     map.keys().map(|k| k.to_string()).collect()
 }
 
-/// What a person entered in a cell, as the mirror keeps it: the formula, the Python code or the
-/// constant. `None` for a cell with nothing entered (format only, or empty).
+/// What a person entered in a cell, as the mirror keeps it, in a short form: `n12.5` (a number),
+/// `stext`, `b1` or `b0`, `=A1*2` (a formula, its anchors after `\u{1}`), or `j` and JSON for
+/// the rest (array formulas, Python code, errors). `None` for a cell with nothing entered.
 fn entry(cell: &Cell) -> Option<String> {
-    let json = if let Some(f) = &cell.formula {
-        serde_json::json!({ "f": &**f })
-    } else if let Some(py) = &cell.py {
-        serde_json::json!({ "py": &**py })
-    } else if cell.value != Value::Empty {
-        serde_json::json!({ "v": &cell.value })
-    } else {
-        return None;
-    };
-    serde_json::to_string(&json).ok()
+    let json = |v: Json| serde_json::to_string(&v).ok().map(|j| format!("j{j}"));
+    if let Some(f) = &cell.formula {
+        if f.array.is_none() && !f.dynamic {
+            return Some(format!("={}", f.text));
+        }
+        return json(serde_json::json!({ "f": &**f }));
+    }
+    if let Some(py) = &cell.py {
+        return json(serde_json::json!({ "py": &**py }));
+    }
+    match &cell.value {
+        Value::Empty => None,
+        Value::Number(n) => Some(format!("n{n}")),
+        Value::Text(t) => Some(format!("s{t}")),
+        Value::Bool(b) => Some(if *b { "b1".into() } else { "b0".into() }),
+        v => json(serde_json::json!({ "v": v })),
+    }
 }
 
 /// The sheet's other settings, each mirrored as a whole (the last change wins): what is compared
@@ -265,18 +273,32 @@ pub struct CellSpec {
 impl CellSpec {
     /// The cell to store, or `None` when there is nothing to store.
     fn to_cell(&self, styles: &mut StyleTable) -> Option<Cell> {
-        let json: Option<Json> = self.entry.as_deref().and_then(|s| serde_json::from_str(s).ok());
-        let mut cell = match json {
-            Some(j) if j.get("f").is_some() => {
-                let f: Formula = serde_json::from_value(j["f"].clone()).ok()?;
-                let expr = gridcraft_formula::parse(&f.text).ok().map(Arc::new);
-                Cell { value: Value::Empty, formula: Some(Arc::new(Formula { expr, ..f })), style: StyleId::DEFAULT, py: None }
+        let entry = self.entry.as_deref().unwrap_or("");
+        // Anchors (after `\u{1}`) were resolved already; what is left is the entry itself.
+        let entry = entry.split('\u{1}').next().unwrap_or("");
+        let rest = entry.get(1..).unwrap_or("");
+        let mut cell = match entry.chars().next() {
+            Some('n') => Cell::value(Value::Number(rest.parse().ok()?)),
+            Some('s') => Cell::value(Value::Text(rest.into())),
+            Some('b') => Cell::value(Value::Bool(rest == "1")),
+            Some('=') => {
+                let expr = gridcraft_formula::parse(rest).ok().map(Arc::new);
+                let f = Formula { text: rest.to_string(), expr, array: None, dynamic: false };
+                Cell { value: Value::Empty, formula: Some(Arc::new(f)), style: StyleId::DEFAULT, py: None }
             }
-            Some(j) if j.get("py").is_some() => {
-                let py: PyCode = serde_json::from_value(j["py"].clone()).ok()?;
-                Cell { value: Value::Empty, formula: None, style: StyleId::DEFAULT, py: Some(Arc::new(py)) }
+            Some('j') => {
+                let j: Json = serde_json::from_str(rest).ok()?;
+                if j.get("f").is_some() {
+                    let f: Formula = serde_json::from_value(j["f"].clone()).ok()?;
+                    let expr = gridcraft_formula::parse(&f.text).ok().map(Arc::new);
+                    Cell { value: Value::Empty, formula: Some(Arc::new(Formula { expr, ..f })), style: StyleId::DEFAULT, py: None }
+                } else if j.get("py").is_some() {
+                    let py: PyCode = serde_json::from_value(j["py"].clone()).ok()?;
+                    Cell { value: Value::Empty, formula: None, style: StyleId::DEFAULT, py: Some(Arc::new(py)) }
+                } else {
+                    Cell::value(serde_json::from_value(j["v"].clone()).unwrap_or(Value::Empty))
+                }
             }
-            Some(j) if j.get("v").is_some() => Cell::value(serde_json::from_value(j["v"].clone()).unwrap_or(Value::Empty)),
             _ => Cell::value(Value::Empty),
         };
         if let Some(style) = self.style.as_deref().and_then(|s| serde_json::from_str::<Style>(s).ok()) {
@@ -577,6 +599,7 @@ impl Collab {
         let fresh = self.sync_sheet_list(after)?;
         let edits = std::mem::take(&mut self.pending);
         let mut reshaped: HashSet<u64> = HashSet::new();
+        let mut sheet_edits: HashMap<u64, Vec<Edit>> = HashMap::new();
         for (name, e) in &edits {
             let Some(si) = after.sheet_index(name) else { continue };
             if si >= self.sheets.len() || fresh.contains(&self.sheets[si].uid) {
@@ -588,6 +611,7 @@ impl Collab {
                 _ => continue,
             }
             reshaped.insert(self.sheets[si].uid);
+            sheet_edits.entry(self.sheets[si].uid).or_default().push(e.clone());
         }
         let base = self.base.clone();
         let base_by_uid: HashMap<u64, &Arc<Sheet>> = base.sheets.iter().map(|s| (s.uid.get(), s)).collect();
@@ -598,7 +622,26 @@ impl Collab {
             if b.is_some_and(|b| Arc::ptr_eq(b, a)) {
                 continue;
             }
-            match b.filter(|_| !reshaped.contains(&uid) && !fresh.contains(&uid)) {
+            match b.filter(|_| !fresh.contains(&uid)) {
+                // Lines inserted or deleted: each cell is compared with the one that was where it
+                // came from, so only what really changed (a formula whose references moved) is
+                // written; the others keep their keys, which name their lines.
+                Some(b) if reshaped.contains(&uid) => {
+                    let edits = sheet_edits.get(&uid).map(Vec::as_slice).unwrap_or_default();
+                    for (c, cell) in a.cells.iter() {
+                        if old_pos(edits, c).and_then(|o| b.cells.get(o)) != Some(cell) {
+                            self.write_cell(si, c, Some(cell), after)?;
+                        }
+                    }
+                    for (o, _) in b.cells.iter() {
+                        if let Some(n) = new_pos(edits, o)
+                            && a.cells.get(n).is_none()
+                        {
+                            self.write_cell(si, n, None, after)?;
+                        }
+                    }
+                    self.sync_features(si, a, Some(b))?;
+                }
                 Some(b) => {
                     for c in b.cells.diff(&a.cells) {
                         self.write_cell(si, c, a.cells.get(c), after)?;
@@ -726,7 +769,20 @@ impl Collab {
         let m = &self.sheets[si];
         let key = m.cell_key(c);
         let map = self.doc.get_map(part(&m.key, "cells").as_str());
-        put(&map, &key, cell.and_then(|x| self.entry_of(si, x, wb)))?;
+        let new = cell.and_then(|x| self.entry_of(si, x, wb));
+        let current = get_str(&map, &key);
+        // A formula whose text changed only because lines moved (`C11` became `C12` after a
+        // row was inserted above) still means the same: its anchors put it right for everyone,
+        // so it is not written again.
+        let same = match (&current, &new) {
+            (Some(c), Some(n)) if c != n && c.contains('\u{1}') && n.contains('\u{1}') => {
+                self.resolve_entry(c.clone()) == n.split('\u{1}').next().unwrap_or_default()
+            }
+            (c, n) => c == n,
+        };
+        if !same {
+            put(&map, &key, new)?;
+        }
         let style = match cell {
             Some(cell) => self.style_key(wb, cell.style)?,
             None => None,
@@ -820,20 +876,23 @@ impl Collab {
     }
 
     /// A cell's entry as the mirror keeps it; a formula with the ids of the lines its references
-    /// point at (`"a"`: per reference, in the order the parser finds them, the sheet's key and the
-    /// row and column ids of its ends).
+    /// point at (after `\u{1}`: per reference, in the order the parser finds them and separated by
+    /// `;`, the sheet's key and the row and column ids of its ends, separated by `,`).
     fn entry_of(&self, si: usize, cell: &Cell, wb: &Workbook) -> Option<String> {
-        let Some(f) = &cell.formula else { return entry(cell) };
-        let mut anchors = Vec::new();
+        let head = entry(cell)?;
+        let Some(f) = &cell.formula else { return Some(head) };
+        let mut anchors: Vec<String> = Vec::new();
         if let Ok(expr) = gridcraft_formula::parse(&f.text) {
             expr.walk(&mut |e| {
                 if let Expr::Ref(r) = e {
-                    anchors.push(self.anchor_of(si, r, wb));
+                    anchors.push(self.anchor_of(si, r, wb).join(","));
                 }
             });
         }
-        let json = if anchors.is_empty() { serde_json::json!({ "f": &**f }) } else { serde_json::json!({ "f": &**f, "a": anchors }) };
-        serde_json::to_string(&json).ok()
+        if anchors.is_empty() {
+            return Some(head);
+        }
+        Some(format!("{head}\u{1}{}", anchors.join(";")))
     }
 
     /// The sheet's key and line ids a reference points at (empty for a 3-D reference or an
@@ -858,20 +917,26 @@ impl Collab {
     /// A formula entry with its references put where their lines are now (`#REF!` for a line
     /// that was deleted), as plain formula text.
     fn resolve_entry(&self, e: String) -> String {
-        if !e.contains("\"a\"") {
-            return e;
+        let Some((head, anchors)) = e.split_once('\u{1}') else { return e };
+        let anchors: Vec<Vec<String>> =
+            anchors.split(';').map(|r| if r.is_empty() { Vec::new() } else { r.split(',').map(str::to_string).collect() }).collect();
+        if let Some(text) = head.strip_prefix('=') {
+            return match self.resolve(text, &anchors) {
+                Some(t) => format!("={t}"),
+                None => head.to_string(),
+            };
         }
-        let Ok(mut j) = serde_json::from_str::<Json>(&e) else { return e };
-        let anchors: Vec<Vec<String>> = serde_json::from_value(j["a"].take()).unwrap_or_default();
-        if let Some(text) = j["f"]["text"].as_str()
-            && let Some(resolved) = self.resolve(text, &anchors)
+        if let Some(json) = head.strip_prefix('j')
+            && let Ok(mut j) = serde_json::from_str::<Json>(json)
         {
-            j["f"]["text"] = Json::String(resolved);
+            if let Some(text) = j["f"]["text"].as_str()
+                && let Some(t) = self.resolve(text, &anchors)
+            {
+                j["f"]["text"] = Json::String(t);
+            }
+            return format!("j{j}");
         }
-        if let Some(o) = j.as_object_mut() {
-            o.remove("a");
-        }
-        serde_json::to_string(&j).unwrap_or(e)
+        head.to_string()
     }
 
     /// `text` with each reference moved to where the lines in `anchors` are now.
@@ -1178,6 +1243,61 @@ fn set_feature(sh: &mut Sheet, f: Feature) {
     }
 }
 
+fn line_of(c: &mut CellRef, axis: Axis) -> &mut u32 {
+    match axis {
+        Axis::Rows => &mut c.row,
+        Axis::Cols => &mut c.col,
+    }
+}
+
+/// Where a cell was before line inserts and deletes (`None` for a cell of an inserted line).
+fn old_pos(edits: &[Edit], mut c: CellRef) -> Option<CellRef> {
+    for e in edits.iter().rev() {
+        match *e {
+            Edit::Insert { axis, at, count } => {
+                let v = line_of(&mut c, axis);
+                if *v >= at.saturating_add(count) {
+                    *v -= count;
+                } else if *v >= at {
+                    return None;
+                }
+            }
+            Edit::Delete { axis, at, count } => {
+                let v = line_of(&mut c, axis);
+                if *v >= at {
+                    *v = v.saturating_add(count);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(c)
+}
+
+/// Where a cell went after line inserts and deletes (`None` for a cell of a deleted line).
+fn new_pos(edits: &[Edit], mut c: CellRef) -> Option<CellRef> {
+    for e in edits {
+        match *e {
+            Edit::Insert { axis, at, count } => {
+                let v = line_of(&mut c, axis);
+                if *v >= at {
+                    *v = v.saturating_add(count);
+                }
+            }
+            Edit::Delete { axis, at, count } => {
+                let v = line_of(&mut c, axis);
+                if *v >= at.saturating_add(count) {
+                    *v -= count;
+                } else if *v >= at {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(c)
+}
+
 /// A reference's kind with its ends at the lines `tokens` name now: `None` when the tokens don't
 /// fit the kind, `Some(None)` when a line was deleted.
 fn resolve_kind(m: &SheetMirror, kind: &RefKind, tokens: &[String]) -> Option<Option<RefKind>> {
@@ -1479,57 +1599,75 @@ mod tests {
     }
 
     /// A worksheet the size of a construction schedule: 5,000 rows of 20 columns (numbers, text,
-    /// formulas, some bold). Run by CI with `--ignored --nocapture` to print the sizes and times.
+    /// formulas, some bold).
+    fn schedule() -> Session {
+        let mut s = session();
+        let d = s.doc_mut().unwrap();
+        let wb = Arc::make_mut(&mut d.wb);
+        let mut bold = wb.styles.get(StyleId::DEFAULT).clone();
+        bold.font.bold = true;
+        let bold = wb.styles.intern(bold);
+        let sh = wb.sheet_mut(0).unwrap();
+        for r in 0..5000u32 {
+            for c in 0..20u32 {
+                let at = CellRef::new(r, c);
+                let cell = match c {
+                    0 => Cell::value(Value::Text(format!("Serviço {r}").into())),
+                    1 => Cell::value(Value::Text("m²".into())),
+                    17 => Cell::formula(Formula::new(&format!("C{}*D{}", r + 1, r + 1))),
+                    18 => Cell::formula(Formula::new(&format!("SUM(C{}:Q{})", r + 1, r + 1))),
+                    19 => Cell::formula(Formula::new(&format!("R{}+S{}", r + 1, r + 1))),
+                    _ => Cell::value(Value::Number((r * 31 + c * 7) as f64 / 3.0)),
+                };
+                let cell = if r % 10 == 0 { Cell { style: bold, ..cell } } else { cell };
+                sh.cells.set(at, cell);
+            }
+        }
+        let mut wb = (*d.wb).clone();
+        d.calc.recalc_all(&mut wb);
+        d.wb = Arc::new(wb);
+        d.saved = d.wb.clone();
+        s
+    }
+
+    /// Inserting a row and typing a number: the times in ms and the updates' sizes in bytes.
+    fn edit_twice(s: &mut Session) -> (u128, usize, u128, usize) {
+        let t0 = clock();
+        s.execute("home.insertRows", json!({"rows": "10:10"})).unwrap();
+        let insert = millis_since(t0);
+        let insert_bytes = s.collab_outbox().iter().map(Vec::len).sum();
+        let t0 = clock();
+        set(s, "D20", "99");
+        let typed = millis_since(t0);
+        let typed_bytes = s.collab_outbox().iter().map(Vec::len).sum();
+        (insert, insert_bytes, typed, typed_bytes)
+    }
+
+    /// Run by CI with `--ignored --nocapture` to print the sizes and times, against the same
+    /// workbook not shared (the engine's own time).
     #[test]
     #[ignore]
     fn measure() {
-        let mut a = session();
-        {
-            let d = a.doc_mut().unwrap();
-            let wb = Arc::make_mut(&mut d.wb);
-            let mut bold = wb.styles.get(StyleId::DEFAULT).clone();
-            bold.font.bold = true;
-            let bold = wb.styles.intern(bold);
-            let sh = wb.sheet_mut(0).unwrap();
-            for r in 0..5000u32 {
-                for c in 0..20u32 {
-                    let at = CellRef::new(r, c);
-                    let cell = match c {
-                        0 => Cell::value(Value::Text(format!("Serviço {r}").into())),
-                        1 => Cell::value(Value::Text("m²".into())),
-                        17 => Cell::formula(Formula::new(&format!("C{}*D{}", r + 1, r + 1))),
-                        18 => Cell::formula(Formula::new(&format!("SUM(C{}:Q{})", r + 1, r + 1))),
-                        19 => Cell::formula(Formula::new(&format!("SUMIF(A:A,A{},S:S)", r + 1))),
-                        _ => Cell::value(Value::Number((r * 31 + c * 7) as f64 / 3.0)),
-                    };
-                    let cell = if r % 10 == 0 { Cell { style: bold, ..cell } } else { cell };
-                    sh.cells.set(at, cell);
-                }
-            }
-            let mut wb = (*d.wb).clone();
-            d.calc.recalc_all(&mut wb);
-            d.wb = Arc::new(wb);
-            d.saved = d.wb.clone();
-        }
+        let mut plain = schedule();
+        let (p_insert, _, p_typed, _) = edit_twice(&mut plain);
+        let mut a = schedule();
         let t0 = clock();
         let snapshot = a.collab_seed().unwrap();
-        let seed_ms = millis_since(t0);
+        let seed = millis_since(t0);
+        let (insert, insert_bytes, typed, typed_bytes) = edit_twice(&mut a);
+        let snapshot = if insert_bytes > 0 { a.collab_snapshot().unwrap() } else { snapshot };
+        let wb = (*schedule().doc().unwrap().wb).clone();
         let t0 = clock();
-        a.execute("home.insertRows", json!({"rows": "10:10"})).unwrap();
-        let insert_ms = millis_since(t0);
-        let update: usize = a.collab_outbox().iter().map(Vec::len).sum();
-        let t0 = clock();
-        set(&mut a, "D20", "99");
-        let typed_ms = millis_since(t0);
-        let typed: usize = a.collab_outbox().iter().map(Vec::len).sum();
-        let mut b = session();
+        let _ = Collab::join(&snapshot, &wb).unwrap();
+        let join_mirror = millis_since(t0);
+        let mut b = schedule();
         let t0 = clock();
         b.collab_join(&snapshot).unwrap();
-        let join_ms = millis_since(t0);
+        let join = millis_since(t0);
         println!(
-            "MEASURE cells=100000 snapshot={} KB seed={seed_ms} ms insert_row={insert_ms} ms (update {} KB) typed={typed_ms} ms (update {typed} B) join={join_ms} ms",
+            "MEASURE cells=100000 snapshot={} KB seed={seed} ms | insert_row shared={insert} ms plain={p_insert} ms update={} KB | typed shared={typed} ms plain={p_typed} ms update={typed_bytes} B | join mirror={join_mirror} ms total={join} ms",
             snapshot.len() / 1024,
-            update / 1024
+            insert_bytes / 1024
         );
     }
 
