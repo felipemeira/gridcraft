@@ -23,6 +23,7 @@ log = { workspace = true }
 gridcraft-xlsx = { workspace = true }
 craft-csv = { workspace = true }
 craft-proof = { workspace = true }
+loro = { workspace = true }
 craft-gridcraft-format = { workspace = true }
 gridcraft-chart = { workspace = true }
 gridcraft-pdf = { workspace = true }

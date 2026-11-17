@@ -11,6 +11,8 @@ pub mod cf;
 mod chart_svg;
 mod clip_html;
 pub mod cmd;
+/// Verto: real-time co-editing.
+pub mod collab;
 pub mod display;
 pub mod fill;
 pub mod io;
@@ -224,6 +226,9 @@ pub struct DocState {
     /// The references `edit.goTo` with `record: true` went to in this document, newest first,
     /// without names, each area written with its sheet (`Sheet1!B14:C22,Sheet1!F19:G30`).
     pub go_to_recent: Vec<String>,
+    /// Verto: while the workbook is edited together with others, the mirror of what everyone
+    /// entered ([`collab`]).
+    pub collab: Option<Box<collab::Collab>>,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -361,6 +366,7 @@ impl DocState {
             touched: None,
             edits: None,
             go_to_recent: vec![],
+            collab: None,
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -704,6 +710,10 @@ impl Session {
     /// Panics inside commands are caught and reported; the workbook is restored.
     pub fn execute(&mut self, id: &str, params: Json) -> Result<Json> {
         let spec = find_command(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
+        // Verto: the history steps of a shared workbook would put back the others' changes too.
+        if matches!(id, "edit.undo" | "edit.redo") && self.collab_active() {
+            return Err(EngineError::Disabled(id.to_string(), "Desfazer e Refazer ainda não funcionam na edição compartilhada.".into()));
+        }
         if let Err(why) = (spec.enabled)(self) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
@@ -915,6 +925,10 @@ impl Session {
         if self.depth == 0 {
             self.trim_history();
             self.group_step = None;
+            // Verto: what the command changed goes to the others.
+            if let Some(uid) = doc_uid {
+                self.collab_capture(uid);
+            }
         } else if let Some(uid) = doc_uid {
             self.bound_tail(uid);
         }

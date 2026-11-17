@@ -402,6 +402,42 @@ fn delete_lines(s: &mut Session, p: &Json, axis: Axis) -> Result<Json> {
     Ok(out)
 }
 
+/// Inserts or deletes whole lines inside an edit, as Insert/Delete Sheet Rows and Columns do
+/// (cells, sheet features and every reference), without the checks a command makes first. Verto's
+/// co-editing ([`crate::collab`]) applies the line inserts and deletes another person made.
+pub(crate) fn apply_line_edit(cx: &mut Ctx, sheet: usize, axis: Axis, insert: bool, at: u32, count: u32) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let name = cx.wb.sheet(sheet).map(|s| s.name.clone()).unwrap_or_default();
+    {
+        let sh = cx.sheet_mut(sheet)?;
+        if insert {
+            match axis {
+                Axis::Rows => sh.cells.shift_rows(at, count as i64),
+                Axis::Cols => sh.cells.shift_cols(at, count as i64),
+            }
+            shift_sheet_features(sh, axis, at, count, true);
+            inherit_line_format(sh, axis, at, count);
+        } else {
+            let block = match axis {
+                Axis::Rows => RangeRef::rows(at, at.saturating_add(count - 1).min(MAX_ROWS - 1)),
+                Axis::Cols => RangeRef::cols(at, at.saturating_add(count - 1).min(MAX_COLS - 1)),
+            };
+            sh.take_cells(block);
+            match axis {
+                Axis::Rows => sh.cells.shift_rows(at + count, -(count as i64)),
+                Axis::Cols => sh.cells.shift_cols(at + count, -(count as i64)),
+            }
+            shift_sheet_features(sh, axis, at, count, false);
+        }
+    }
+    let e = if insert { Edit::Insert { axis, at, count } } else { Edit::Delete { axis, at, count } };
+    rewrite(cx, &name, &e)?;
+    cx.structural = true;
+    Ok(())
+}
+
 /// Reorders a contiguous block of whole columns without replacing the destination columns.
 /// `before` is a boundary in the original sheet: moving B:C before E produces A,D,B,C,E.
 fn move_columns(s: &mut Session, p: &Json) -> Result<Json> {

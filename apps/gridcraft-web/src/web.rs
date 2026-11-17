@@ -5,6 +5,7 @@ use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 
+mod collab;
 mod dictionaries;
 
 const CANVAS_ID: &str = "gridcraft_canvas";
@@ -109,7 +110,9 @@ pub fn start() {
                         bridge.post_ready();
                     }
                     crate::api::install(&mut app, cc.egui_ctx.clone());
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs }))
+                    // Verto: co-editing messages, in host mode only.
+                    let collab = app_bridge.as_ref().and_then(|_| collab::Link::install(cc.egui_ctx.clone()));
+                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge, prefs, collab }))
                 }),
             )
             .await;
@@ -138,6 +141,7 @@ struct WebShell {
     inbox: Inbox,
     bridge: Option<crate::host::Bridge>,
     prefs: crate::prefs::PrefsSync,
+    collab: Option<collab::Link>,
 }
 
 fn local_storage() -> Option<web_sys::Storage> {
@@ -167,6 +171,10 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
+        // After the frame's own work (a workbook the host sent is open by now).
+        if let Some(link) = &self.collab {
+            link.process(&mut self.app);
+        }
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#1562).
         let changed = self.prefs.changed(&self.app);
         if !changed.is_empty() {
@@ -190,6 +198,9 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        if let Some(link) = &self.collab {
+            link.flush(&mut self.app);
+        }
         if let Some(bridge) = &self.bridge {
             bridge.sync(&mut self.app);
         }

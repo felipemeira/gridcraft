@@ -433,6 +433,9 @@ pub(crate) fn commit<R>(d: &mut DocState, f: impl FnOnce(&mut Ctx) -> Result<R>)
             }
         }
     }
+    if let Some(c) = d.collab.as_mut() {
+        c.note_edits(&edits);
+    }
     if let Some(log) = d.edits.as_mut() {
         log.extend(edits);
     }
