@@ -37,6 +37,9 @@ pub struct Services {
     pub paste_image: Option<Box<dyn FnMut() -> Option<image::RgbaImage>>>,
     /// Web: deliver a file to the user (name, bytes).
     pub download: Option<Download>,
+    /// Verto (host mode): asks the host to open one of the documents it offers
+    /// ([`crate::SheetApp::host_documents`]), by name.
+    pub open_document: Option<Box<dyn Fn(&str)>>,
     /// Web: start an asynchronous file pick; the bytes arrive later in `inbox`.
     pub open_async: Option<Box<dyn Fn()>>,
     /// Files delivered asynchronously (name, bytes), opened on the next frame.

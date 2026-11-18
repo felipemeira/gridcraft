@@ -376,6 +376,10 @@ const MODIFIED_W: f32 = 150.0;
 fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Outcome, limit: usize) {
     let t = Tokens::get(ui.ctx());
     let lang = app.ui.language;
+    if let Some(docs) = app.host_documents.clone() {
+        host_list(app, ui, out, &docs, limit);
+        return;
+    }
     if app.ui.recent.is_empty() {
         dim(ui, lang.tr("No recent workbooks yet."));
         return;
@@ -424,6 +428,37 @@ fn recent_list(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &mut Ou
             if app.session.active().and_then(|d| d.path.as_deref()) == Some(path.as_str()) {
                 out.close = true;
             }
+        }
+    }
+}
+
+/// Verto (host mode): the documents the host offers, each with its detail (size, version, when
+/// saved); a click asks the host to open it.
+fn host_list(app: &mut SheetApp, ui: &mut Ui, out: &mut Outcome, docs: &[(String, String)], limit: usize) {
+    let t = Tokens::get(ui.ctx());
+    let lang = app.ui.language;
+    if docs.is_empty() {
+        dim(ui, lang.tr("No recent workbooks yet."));
+        return;
+    }
+    let width = ui.available_width().min(CONTENT_W);
+    let current = app.session.active().map(|d| d.display_title());
+    for (name, detail) in docs.iter().take(limit) {
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, 44.0), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
+        let p = ui.painter();
+        if resp.hovered() || current.as_deref() == Some(name.as_str()) {
+            p.rect_filled(rect, 4.0, t.hover);
+        }
+        icons::paint(p, Rect::from_center_size(pos2(rect.left() + 20.0, rect.center().y), vec2(20.0, 20.0)), Icon::Book, t.text);
+        let text = p.with_clip_rect(rect.intersect(p.clip_rect()));
+        text.text(pos2(rect.left() + 42.0, rect.center().y - 8.0), Align2::LEFT_CENTER, name, theme::ui_font(13.5), t.text);
+        text.text(pos2(rect.left() + 42.0, rect.center().y + 9.0), Align2::LEFT_CENTER, detail, theme::ui_font(11.5), t.text_dim);
+        if resp.clicked() {
+            if let Some(open) = &app.services.open_document {
+                open(name);
+            }
+            out.close = true;
         }
     }
 }

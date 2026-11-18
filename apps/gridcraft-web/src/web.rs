@@ -66,6 +66,24 @@ pub fn start() {
                     let mut services = services(inbox.clone(), cc.egui_ctx.clone());
                     if let Some(bridge) = &app_bridge {
                         bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
+                        // Verto: the host keeps the documents. File › Open lists the ones it
+                        // offers and asks it to open one; a file picked with Browse… goes to it.
+                        services.open_document = Some(Box::new(|name: &str| {
+                            collab::post_json("gridcraft:open-request", &serde_json::to_string(name).unwrap_or_default());
+                        }));
+                        services.open_async = Some(Box::new(|| {
+                            wasm_bindgen_futures::spawn_local(async move {
+                                let Some(file) = rfd::AsyncFileDialog::new()
+                                    .add_filter("Spreadsheets", &["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv"])
+                                    .pick_file()
+                                    .await
+                                else {
+                                    return;
+                                };
+                                let bytes = file.read().await;
+                                collab::post_file("gridcraft:upload", &file.file_name(), &bytes);
+                            });
+                        }));
                     }
                     let mut app = SheetApp::new(session, services);
                     app.ui.system_theme = true;

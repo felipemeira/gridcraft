@@ -239,6 +239,9 @@ pub struct SheetApp {
     pub ui: UiState,
     /// The window chrome to draw (see [`Chrome`]).
     pub chrome: Chrome,
+    /// Verto (host mode): the documents the host offers (name, detail), newest first. When set,
+    /// File › Open and the Recent lists show these instead of the files on this device.
+    pub host_documents: Option<Vec<(String, String)>>,
     /// Scroll position per (window id, sheet uid): each sheet keeps its own when sheets are
     /// inserted, deleted or moved.
     pub views: HashMap<(u64, u64), SheetView>,

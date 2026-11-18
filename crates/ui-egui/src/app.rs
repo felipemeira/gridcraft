@@ -32,6 +32,7 @@ impl SheetApp {
             session,
             ui: UiState::default(),
             chrome: Chrome::default(),
+            host_documents: None,
             views: HashMap::new(),
             editor: None,
             text_box_editor: None,

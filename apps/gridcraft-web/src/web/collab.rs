@@ -9,6 +9,9 @@
 //! - `gridcraft:collab-update` `{ bytes }`: someone else's changes.
 //! - `gridcraft:collab-snapshot-request`: the whole shared document, for someone joining.
 //! - `gridcraft:collab-stop`.
+//! - `gridcraft:documents` `{ json: [{ name, detail }] }`: the documents the host offers, shown in
+//!   File › Open and Recent; choosing one sends `gridcraft:open-request` `{ json: "name" }`, and a
+//!   file picked with Browse… goes to the host as `gridcraft:upload` `{ name, bytes }`.
 //! - `gridcraft:collab-peers` `{ json }`: the others, as JSON `[{ id, name, color: "#rrggbb", sheet,
 //!   ranges: ["A1:B2"], active: "A1" }]`; the grid draws their selections. `gridcraft:collab-goto`
 //!   `{ json: { sheet, cell } }`: go to where someone is.
@@ -35,6 +38,7 @@ enum Incoming {
     Stop,
     Peers(String),
     GoTo(String),
+    Documents(String),
 }
 
 pub struct Link {
@@ -73,6 +77,7 @@ impl Link {
                 "gridcraft:collab-stop" => Some(Incoming::Stop),
                 "gridcraft:collab-peers" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::Peers),
                 "gridcraft:collab-goto" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::GoTo),
+                "gridcraft:documents" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::Documents),
                 _ => None,
             };
             if let Some(m) = message {
@@ -118,6 +123,7 @@ impl Link {
                 }
                 Incoming::Peers(json) => app.session.collab_peers = peers(&json),
                 Incoming::GoTo(json) => go_to(app, &json),
+                Incoming::Documents(json) => app.host_documents = Some(documents(&json)),
             }
         }
         self.flush(app);
@@ -162,6 +168,15 @@ fn peers(json: &str) -> Vec<gridcraft_engine::collab::Peer> {
         .collect()
 }
 
+/// The host's documents, from `[{ name, detail }]`.
+fn documents(json: &str) -> Vec<(String, String)> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).unwrap_or_default();
+    list.iter()
+        .filter_map(|d| Some((d["name"].as_str()?.chars().take(200).collect(), d["detail"].as_str().unwrap_or_default().chars().take(200).collect())))
+        .take(500)
+        .collect()
+}
+
 /// Goes to where someone is: `{ sheet, cell }`.
 fn go_to(app: &mut SheetApp, json: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return };
@@ -173,7 +188,7 @@ fn go_to(app: &mut SheetApp, json: &str) {
     }
 }
 
-fn post_json(kind: &str, json: &str) {
+pub(super) fn post_json(kind: &str, json: &str) {
     let Some(window) = web_sys::window() else { return };
     let Ok(Some(parent)) = window.parent() else { return };
     let Ok(origin) = window.location().origin() else { return };
@@ -182,6 +197,21 @@ fn post_json(kind: &str, json: &str) {
     let _ = js_sys::Reflect::set(&message, &JsValue::from_str("json"), &JsValue::from_str(json));
     if let Err(e) = parent.post_message(&message, &origin) {
         log::warn!("co-editing: couldn't post {kind}: {e:?}");
+    }
+}
+
+/// Hands the host a file picked here (File › Open, Browse…): it keeps it with the other
+/// documents and opens it.
+pub(super) fn post_file(kind: &str, name: &str, bytes: &[u8]) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(Some(parent)) = window.parent() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    let message = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&message, &JsValue::from_str("type"), &JsValue::from_str(kind));
+    let _ = js_sys::Reflect::set(&message, &JsValue::from_str("name"), &JsValue::from_str(name));
+    let _ = js_sys::Reflect::set(&message, &JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes).buffer().into());
+    if let Err(e) = parent.post_message(&message, &origin) {
+        log::warn!("couldn't post {kind}: {e:?}");
     }
 }
 

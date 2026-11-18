@@ -142,6 +142,26 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                         }
                     }
                 });
+                // Verto: who else is editing this workbook, in their colours, as Excel shows them
+                // beside Share; a click goes to where they are.
+                for peer in app.session.collab_peers.clone().iter().rev() {
+                    let (rect, resp) = ui.allocate_exact_size(vec2(26.0, ch), Sense::click());
+                    let [r, g, b] = peer.color;
+                    let painter = ui.painter();
+                    painter.circle_filled(rect.center(), 11.0, Color32::from_rgb(r, g, b));
+                    painter.circle_stroke(rect.center(), 11.0, Stroke::new(1.5, Color32::WHITE));
+                    let initials: String =
+                        peer.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).flat_map(char::to_uppercase).collect();
+                    painter.text(rect.center(), egui::Align2::CENTER_CENTER, initials, egui::FontId::proportional(10.5), Color32::WHITE);
+                    let resp = resp.on_hover_text(format!("{} · {}", peer.name, peer.active.a1()));
+                    if resp.clicked() {
+                        let sheet = app.session.active().and_then(|d| d.wb.sheets.get(peer.sheet)).map(|s| s.name.clone());
+                        if let Some(sheet) = sheet {
+                            let reference = format!("'{}'!{}", sheet.replace('\'', "''"), peer.active.a1());
+                            app.run_or_alert("edit.goTo", json!({"reference": reference}));
+                        }
+                    }
+                }
                 let __k = icon_button(ui, Icon::Comment, t.text_dim, "Comments", vec2(28.0, ch));
                 control_keytip(app, ui, &__k, "comments");
                 if __k.clicked() {
