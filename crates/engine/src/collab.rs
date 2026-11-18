@@ -1877,6 +1877,22 @@ mod tests {
     }
 
     #[test]
+    fn read_only_refuses_changes_but_takes_the_others() {
+        let (mut a, mut b) = pair();
+        b.read_only = true;
+        assert!(b.execute("cell.set", json!({"cell": "B1", "input": "x"})).is_err());
+        assert!(b.execute("home.insertRows", json!({"rows": "1:1"})).is_err());
+        assert!(b.locked_cell_message(0, CellRef::parse("B1").unwrap()).is_some());
+        assert!(b.execute("sheet.activate", json!({"sheet": 0})).is_ok());
+        set(&mut a, "A1", "7");
+        a.execute("home.insertSheet", json!({})).unwrap();
+        pass(&mut a, &mut b);
+        assert_eq!(shown(&b, "A2"), Value::Number(14.0));
+        assert_eq!(b.doc().unwrap().wb.sheets.len(), a.doc().unwrap().wb.sheets.len());
+        assert!(b.collab_outbox().is_empty());
+    }
+
+    #[test]
     fn joining_takes_the_shared_cells() {
         let (_, b) = pair();
         assert_eq!(shown(&b, "A1"), Value::Number(5.0));

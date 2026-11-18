@@ -574,6 +574,9 @@ pub struct Session {
     /// Verto: while someone else's changes are being made here with commands, they are not
     /// written back into the mirror.
     pub(crate) collab_quiet: bool,
+    /// Verto: this person may only read the workbook. Commands that change it are refused (the
+    /// others' changes still arrive through the mirror) and no cell edit starts.
+    pub read_only: bool,
 }
 
 impl Session {
@@ -617,6 +620,9 @@ impl Session {
     /// is allowed. Front ends ask before opening an editor, so typing into a locked cell never
     /// leaves a draft that can't be entered (and so blocks saving).
     pub fn locked_cell_message(&self, sheet: usize, at: CellRef) -> Option<String> {
+        if self.read_only {
+            return Some(cmd::READ_ONLY.into());
+        }
         let d = self.active()?;
         let sh = d.wb.sheet(sheet)?;
         if !sh.is_protected() || !d.wb.styles.get(sh.style_id(at)).protection.locked {
@@ -722,7 +728,7 @@ impl Session {
             let steps = params.get("steps").and_then(Json::as_u64).unwrap_or(1).clamp(1, 100) as usize;
             return self.collab_undo(id == "edit.redo", steps);
         }
-        if let Err(why) = (spec.enabled)(self) {
+        if let Err(why) = (spec.enabled)(self).and_then(|()| cmd::read_only_check(self, spec)) {
             return Err(EngineError::Disabled(id.to_string(), why));
         }
         // A debugger whose undo group something else ended locks nothing any more (`macro.debug`

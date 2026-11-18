@@ -125,6 +125,9 @@ pub fn start() {
                         if let Some(author) = query_param("author") {
                             crate::host::Bridge::set_author(&mut app, &author);
                         }
+                        // Verto: `?readonly=1` opens the workbook only to read (and to follow the
+                        // others' changes); the host doesn't save it either.
+                        app.session.read_only = query_param("readonly").is_some_and(|v| v == "1");
                         bridge.post_ready();
                     }
                     crate::api::install(&mut app, cc.egui_ctx.clone());

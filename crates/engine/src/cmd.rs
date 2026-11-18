@@ -88,9 +88,22 @@ impl CommandInfo {
     }
 }
 
+/// Verto: why a read-only workbook refuses a change.
+pub const READ_ONLY: &str = "Este documento está aberto só para leitura.";
+
+/// Verto: a read-only workbook refuses the commands that change it, run by the person (at the top
+/// level). The others' changes, made here with commands while the mirror applies them, go ahead.
+pub(crate) fn read_only_check(s: &Session, spec: &CommandSpec) -> std::result::Result<(), String> {
+    if s.read_only && !s.collab_quiet && s.depth == 0 && (spec.undoable || spec.id.starts_with("macro.run")) {
+        Err(READ_ONLY.into())
+    } else {
+        Ok(())
+    }
+}
+
 impl CommandSpec {
     pub fn info(&self, s: &Session) -> CommandInfo {
-        let e = (self.enabled)(s);
+        let e = (self.enabled)(s).and_then(|()| read_only_check(s, self));
         CommandInfo {
             id: self.id,
             label: self.label,
