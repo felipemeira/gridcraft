@@ -58,7 +58,7 @@ const SHEET_ORDER: &str = "sheet-order";
 
 /// How the mirror is laid out. Someone with a GridCraft that lays it out otherwise can't join
 /// (a page left open from before an update): they are told to reload.
-const FORMAT: i64 = 3;
+const FORMAT: i64 = 4;
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("co-editing: {e}"))
@@ -202,6 +202,40 @@ fn entry(cell: &Cell) -> Option<String> {
     }
 }
 
+/// A number in base 36, for short keys.
+fn base36(mut n: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut out = Vec::new();
+    loop {
+        out.push(DIGITS[(n % 36) as usize]);
+        n /= 36;
+        if n == 0 {
+            break;
+        }
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// A row's or column's height or width and settings as the mirror holds them, its format as the
+/// style's JSON (a style number means something only in the workbook that made it).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LineSpec {
+    pub info: LineInfo,
+    pub style: Option<String>,
+}
+
+/// Lines as the workbook keeps them, their formats added to its style table.
+fn lines_from(specs: BTreeMap<u32, LineSpec>, styles: &mut StyleTable) -> BTreeMap<u32, LineInfo> {
+    specs
+        .into_iter()
+        .map(|(i, spec)| {
+            let style = spec.style.as_deref().and_then(|j| serde_json::from_str::<Style>(j).ok()).map(|st| styles.intern(st));
+            (i, LineInfo { style, ..spec.info })
+        })
+        .collect()
+}
+
 /// The sheet's other settings, each mirrored as a whole (the last change wins): what is compared
 /// and written after a command, and set from the mirror when someone else changed it.
 macro_rules! sheet_settings {
@@ -322,8 +356,8 @@ pub struct LineChange {
 /// A part of a sheet someone else changed, rebuilt whole from the mirror.
 #[derive(Clone, Debug)]
 pub enum Feature {
-    Rows(BTreeMap<u32, LineInfo>),
-    Cols(BTreeMap<u32, LineInfo>),
+    Rows(BTreeMap<u32, LineSpec>),
+    Cols(BTreeMap<u32, LineSpec>),
     Merges(Vec<RangeRef>),
     Comments(BTreeMap<CellRef, Comment>),
     Links(BTreeMap<CellRef, Hyperlink>),
@@ -396,10 +430,22 @@ impl Remote {
             cx.touch(si, c);
         }
         for (si, feature) in self.features {
+            let feature = match feature {
+                Feature::Rows(rows) => {
+                    let rows = lines_from(rows, &mut cx.wb.styles);
+                    cx.sheet_mut(si)?.rows = rows;
+                    continue;
+                }
+                Feature::Cols(cols) => {
+                    let cols = lines_from(cols, &mut cx.wb.styles);
+                    cx.sheet_mut(si)?.cols = cols;
+                    continue;
+                }
+                f => f,
+            };
             let sh = cx.sheet_mut(si)?;
             match feature {
-                Feature::Rows(rows) => sh.rows = rows,
-                Feature::Cols(cols) => sh.cols = cols,
+                Feature::Rows(_) | Feature::Cols(_) => {}
                 Feature::Merges(merges) => sh.merges = merges,
                 Feature::Comments(comments) => sh.comments = comments,
                 Feature::Links(links) => sh.hyperlinks = links,
@@ -538,7 +584,7 @@ impl Collab {
             let sh = Arc::make_mut(&mut out.sheets[si]);
             sh.cells = store;
             for f in features {
-                set_feature(sh, f);
+                set_feature(sh, &mut out.styles, f);
             }
         }
         Ok((c, out))
@@ -644,13 +690,13 @@ impl Collab {
                             self.write_cell(si, n, None, after)?;
                         }
                     }
-                    self.sync_features(si, a, Some(b))?;
+                    self.sync_features(si, a, Some(b), after)?;
                 }
                 Some(b) => {
                     for c in b.cells.diff(&a.cells) {
                         self.write_cell(si, c, a.cells.get(c), after)?;
                     }
-                    self.sync_features(si, a, Some(b))?;
+                    self.sync_features(si, a, Some(b), after)?;
                 }
                 None => self.sync_sheet(si, after)?,
             }
@@ -761,7 +807,7 @@ impl Collab {
         let json = serde_json::to_string(wb.styles.get(id)).map_err(err)?;
         let mut h = std::collections::hash_map::DefaultHasher::new();
         json.hash(&mut h);
-        let key = format!("{:016x}", h.finish());
+        let key = base36(h.finish() >> 20);
         let styles = self.doc.get_map("styles");
         if get_str(&styles, &key).is_none() {
             styles.insert(&key, json).map_err(err)?;
@@ -809,11 +855,11 @@ impl Collab {
                 map.delete(&k).map_err(err)?;
             }
         }
-        self.sync_features(si, sh, None)
+        self.sync_features(si, sh, None, wb)
     }
 
     /// Writes the sheet's other parts that differ from `b` (all of them without `b`).
-    fn sync_features(&self, si: usize, a: &Sheet, b: Option<&Sheet>) -> Result<()> {
+    fn sync_features(&self, si: usize, a: &Sheet, b: Option<&Sheet>, wb: &Workbook) -> Result<()> {
         let m = &self.sheets[si];
         for (axis, kind, info) in [(Axis::Rows, "rowinfo", &a.rows), (Axis::Cols, "colinfo", &a.cols)] {
             let old = b.map(|b| if axis == Axis::Rows { &b.rows } else { &b.cols });
@@ -825,7 +871,7 @@ impl Collab {
             let mut keep = HashSet::new();
             for (i, li) in info {
                 let token = lines.token(*i);
-                put(&map, &token, serde_json::to_string(li).ok())?;
+                put(&map, &token, Some(self.line_entry(li, wb)?))?;
                 keep.insert(token);
             }
             for k in map_keys(&map) {
@@ -860,6 +906,37 @@ impl Collab {
             }
         }
         Ok(())
+    }
+
+    /// A line's entry: `size|hidden|outline|collapsed|style key|custom` (`17|0|0|0||1`).
+    fn line_entry(&self, li: &LineInfo, wb: &Workbook) -> Result<String> {
+        let style = match li.style {
+            Some(id) => self.style_key(wb, id)?.unwrap_or_default(),
+            None => String::new(),
+        };
+        Ok(format!(
+            "{}|{}|{}|{}|{style}|{}",
+            li.size.map(|s| s.to_string()).unwrap_or_default(),
+            u8::from(li.hidden),
+            li.outline,
+            u8::from(li.collapsed),
+            u8::from(li.custom)
+        ))
+    }
+
+    fn parse_line(&self, v: &str) -> Option<LineSpec> {
+        let parts: Vec<&str> = v.split('|').collect();
+        let [size, hidden, outline, collapsed, style, custom] = parts.as_slice() else { return None };
+        let info = LineInfo {
+            size: if size.is_empty() { None } else { size.parse().ok() },
+            hidden: *hidden == "1",
+            outline: outline.parse().unwrap_or(0),
+            collapsed: *collapsed == "1",
+            style: None,
+            custom: *custom == "1",
+        };
+        let style = if style.is_empty() { None } else { get_str(&self.doc.get_map("styles"), style) };
+        Some(LineSpec { info, style })
     }
 
     /// A map of things kept by cell (notes, links): writes these, drops the others.
@@ -1000,8 +1077,7 @@ impl Collab {
         match kind {
             "rowinfo" | "colinfo" => {
                 let lines = if kind == "rowinfo" { &m.rows } else { &m.cols };
-                let info: BTreeMap<u32, LineInfo> =
-                    entries().filter_map(|(k, v)| Some((lines.find(&k)?, serde_json::from_str(&v).ok()?))).collect();
+                let info: BTreeMap<u32, LineSpec> = entries().filter_map(|(k, v)| Some((lines.find(&k)?, self.parse_line(&v)?))).collect();
                 vec![if kind == "rowinfo" { Feature::Rows(info) } else { Feature::Cols(info) }]
             }
             "merges" => {
@@ -1236,10 +1312,10 @@ impl Collab {
 }
 
 /// Sets a part of a sheet from the mirror (on a workbook being joined).
-fn set_feature(sh: &mut Sheet, f: Feature) {
+fn set_feature(sh: &mut Sheet, styles: &mut StyleTable, f: Feature) {
     match f {
-        Feature::Rows(rows) => sh.rows = rows,
-        Feature::Cols(cols) => sh.cols = cols,
+        Feature::Rows(rows) => sh.rows = lines_from(rows, styles),
+        Feature::Cols(cols) => sh.cols = lines_from(cols, styles),
         Feature::Merges(merges) => sh.merges = merges,
         Feature::Comments(comments) => sh.comments = comments,
         Feature::Links(links) => sh.hyperlinks = links,
@@ -1875,6 +1951,19 @@ mod tests {
         assert_eq!(sb.merges, sa.merges);
         assert_eq!(sa.merges[0].start.row, 1);
         assert_eq!(sb.comments.keys().collect::<Vec<_>>(), sa.comments.keys().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_formatted_row_reaches_the_other_with_its_format() {
+        let (mut a, mut b) = pair();
+        a.execute("home.bold", json!({"range": "3:3"})).unwrap();
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        let bold = |s: &Session| {
+            let wb = &s.doc().unwrap().wb;
+            wb.sheets[0].rows.get(&2).and_then(|li| li.style).map(|st| wb.styles.get(st).font.bold)
+        };
+        assert_eq!(bold(&b), bold(&a));
     }
 
     #[test]
