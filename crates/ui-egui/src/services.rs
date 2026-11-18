@@ -40,6 +40,12 @@ pub struct Services {
     /// Verto (host mode): asks the host to open one of the documents it offers
     /// ([`crate::SheetApp::host_documents`]), by name.
     pub open_document: Option<Box<dyn Fn(&str)>>,
+    /// Verto (host mode): the Share button asks the host to open its own sharing dialog (who
+    /// may read and edit the document).
+    pub share: Option<Box<dyn Fn()>>,
+    /// Verto (host mode): the title bar's Close (×) hands the workbook back to the host, after
+    /// the Save Changes question ([`crate::SheetApp::request_host_close`]).
+    pub close_document: Option<Box<dyn Fn()>>,
     /// Web: start an asynchronous file pick; the bytes arrive later in `inbox`.
     pub open_async: Option<Box<dyn Fn()>>,
     /// Files delivered asynchronously (name, bytes), opened on the next frame.

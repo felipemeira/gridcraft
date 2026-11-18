@@ -71,6 +71,8 @@ pub fn start() {
                         services.open_document = Some(Box::new(|name: &str| {
                             collab::post_json("gridcraft:open-request", &serde_json::to_string(name).unwrap_or_default());
                         }));
+                        services.share = Some(Box::new(|| collab::post_json("gridcraft:share-request", "null")));
+                        services.close_document = Some(Box::new(|| collab::post_json("gridcraft:close-request", "null")));
                         services.open_async = Some(Box::new(|| {
                             wasm_bindgen_futures::spawn_local(async move {
                                 let Some(file) = rfd::AsyncFileDialog::new()

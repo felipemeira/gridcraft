@@ -124,24 +124,41 @@ pub fn title_bar(app: &mut SheetApp, ui: &mut Ui) {
                     ui.add_space(3.0 * CONTROL_W);
                 }
                 ui.add_space(8.0);
+                // Verto: closing hands the workbook back to the host (asking about unsaved changes
+                // first), as Excel's × does.
+                if app.services.close_document.is_some() {
+                    let close = icon_button(ui, Icon::Close, t.text, "Close", vec2(30.0, ch));
+                    if close.clicked() {
+                        app.request_host_close();
+                    }
+                    ui.add_space(6.0);
+                }
                 let __k = icon_button(ui, Icon::Search, t.text_dim, "Search commands", vec2(28.0, ch));
                 control_keytip(app, ui, &__k, "commandSearch");
                 if __k.clicked() {
                     app.open_dialog("commandSearch", json!({}));
                 }
-                let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
-                egui::Popup::menu(&share).show(|ui| {
-                    if ui.button("Export as PDF…").clicked() {
-                        app.run_or_alert("file.exportPdf", json!({}));
+                // Verto: the host's own sharing dialog (who may read and edit); exporting stays in
+                // File › Export.
+                if let Some(host_share) = &app.services.share {
+                    if small_button(ui, Icon::Share, "Share", "Share: who can read and edit this document", true).clicked() {
+                        host_share();
                     }
-                    for (label, fmt) in
-                        [("Save a Copy as Excel Workbook (.xlsx)…", "xlsx"), ("Export as CSV…", "csv"), ("Export as Web Page (.html)…", "html")]
-                    {
-                        if ui.button(label).clicked() {
-                            app.open_dialog("saveCopy", json!({"format": fmt}));
+                } else {
+                    let share = small_button(ui, Icon::Share, "Share", "Share: export or save a copy", true);
+                    egui::Popup::menu(&share).show(|ui| {
+                        if ui.button("Export as PDF…").clicked() {
+                            app.run_or_alert("file.exportPdf", json!({}));
                         }
-                    }
-                });
+                        for (label, fmt) in
+                            [("Save a Copy as Excel Workbook (.xlsx)…", "xlsx"), ("Export as CSV…", "csv"), ("Export as Web Page (.html)…", "html")]
+                        {
+                            if ui.button(label).clicked() {
+                                app.open_dialog("saveCopy", json!({"format": fmt}));
+                            }
+                        }
+                    });
+                }
                 // Verto: who else is editing this workbook, in their colours, as Excel shows them
                 // beside Share; a click goes to where they are.
                 for peer in app.session.collab_peers.clone().iter().rev() {

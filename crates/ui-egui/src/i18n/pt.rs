@@ -973,6 +973,7 @@ pub(super) fn translate(text: &str) -> Option<&'static str> {
         "Select and move ink and shapes" => "Selecionar e mover tinta e formas",
         "Series…" => "Série…",
         "Share: export or save a copy" => "Compartilhar: exportar ou salvar uma cópia",
+        "Share: who can read and edit this document" => "Compartilhar: quem pode ler e editar este documento",
         "Show Formulas (⌃`)" => "Mostrar Fórmulas (⌃`)",
         "Slicer" => "Segmentação de Dados",
         "Sort & Filter" => "Classificar e Filtrar",

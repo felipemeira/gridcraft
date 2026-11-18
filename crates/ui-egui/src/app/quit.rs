@@ -81,6 +81,49 @@ impl SheetApp {
         true
     }
 
+    /// Verto (host mode): the title bar's Close. The cell being edited is entered; a workbook with
+    /// unsaved changes asks first (Save, Don't Save, Cancel), as Excel does; then the host takes
+    /// it back ([`crate::services::Services::close_document`]). Read-only, there is nothing to save.
+    pub fn request_host_close(&mut self) {
+        if !self.commit_edit(0, 0, false, false) {
+            return;
+        }
+        let dirty = !self.session.read_only && self.session.active().is_some_and(|d| d.is_dirty());
+        if dirty {
+            let title = self.session.active().map(|d| d.display_title()).unwrap_or_default();
+            self.open_dialog("saveChanges", json!({"title": title, "host": true}));
+        } else if let Some(close) = &self.services.close_document {
+            close();
+        }
+    }
+
+    /// Answers the Save Changes question of [`Self::request_host_close`]. Returns whether the
+    /// question is settled: Save keeps it open when the workbook couldn't be saved.
+    pub fn answer_host_close(&mut self, answer: SaveAnswer) -> bool {
+        match answer {
+            SaveAnswer::Cancel => true,
+            SaveAnswer::DontSave => {
+                if let Some(close) = &self.services.close_document {
+                    close();
+                }
+                true
+            }
+            SaveAnswer::Save => {
+                if !self.commit_edit(0, 0, false, false) {
+                    return false;
+                }
+                self.run_or_alert("file.save", json!({}));
+                if self.session.active().is_some_and(|d| d.is_dirty()) {
+                    return false;
+                }
+                if let Some(close) = &self.services.close_document {
+                    close();
+                }
+                true
+            }
+        }
+    }
+
     /// Quit (the macOS app menu, ⌘Q): commits every window's cell draft as Enter would, lets the
     /// macro step editor ask about its unsaved steps, then asks about each unsaved workbook in its
     /// window; Cancel on any of them stops the quit. A draft its
