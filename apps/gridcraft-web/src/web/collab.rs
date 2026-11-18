@@ -15,6 +15,9 @@
 //! - `gridcraft:collab-peers` `{ json }`: the others, as JSON `[{ id, name, color: "#rrggbb", sheet,
 //!   ranges: ["A1:B2"], active: "A1" }]`; the grid draws their selections. `gridcraft:collab-goto`
 //!   `{ json: { sheet, cell } }`: go to where someone is.
+//! - `gridcraft:links` `{ json: [{ book, sheet, cells: [[row, col, value]] }] }`: the values of other
+//!   documents that formulas point at (`'[Book.xlsx]Sheet'!A1`); GridCraft asks for the blocks it
+//!   needs with `gridcraft:links-wanted` `{ json: [{ book, sheet, range }] }`.
 //!
 //! To the host: `gridcraft:collab-update` `{ bytes }` with this person's changes,
 //! `gridcraft:collab-snapshot` `{ bytes }`, `gridcraft:collab-state` `{ active, error? }`, and
@@ -39,6 +42,7 @@ enum Incoming {
     Peers(String),
     GoTo(String),
     Documents(String),
+    Links(String),
 }
 
 pub struct Link {
@@ -78,6 +82,7 @@ impl Link {
                 "gridcraft:collab-peers" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::Peers),
                 "gridcraft:collab-goto" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::GoTo),
                 "gridcraft:documents" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::Documents),
+                "gridcraft:links" => field(&data, "json").and_then(|v| v.as_string()).map(Incoming::Links),
                 _ => None,
             };
             if let Some(m) = message {
@@ -124,6 +129,11 @@ impl Link {
                 Incoming::Peers(json) => app.session.collab_peers = peers(&json),
                 Incoming::GoTo(json) => go_to(app, &json),
                 Incoming::Documents(json) => app.host_documents = Some(documents(&json)),
+                Incoming::Links(json) => {
+                    if let Err(e) = app.session.set_linked(&json) {
+                        log::warn!("linked values: {e}");
+                    }
+                }
             }
         }
         self.flush(app);
@@ -133,6 +143,11 @@ impl Link {
     pub fn flush(&self, app: &mut SheetApp) {
         for update in app.session.collab_outbox() {
             post("gridcraft:collab-update", Some(&update), None);
+        }
+        let wanted = app.session.linked_wanted();
+        if !wanted.is_empty() {
+            let list: Vec<_> = wanted.iter().map(|(book, sheet, range)| serde_json::json!({"book": book, "sheet": sheet, "range": range})).collect();
+            post_json("gridcraft:links-wanted", &serde_json::Value::Array(list).to_string());
         }
         let presence = app
             .session

@@ -17,6 +17,7 @@ pub mod display;
 pub mod fill;
 pub mod io;
 pub mod links;
+mod linked_books;
 pub mod macros;
 pub mod outline;
 pub mod paper;

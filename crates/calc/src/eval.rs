@@ -308,6 +308,13 @@ impl<'h> Evaluator<'h> {
 
     pub fn reference_areas(&self, r: &Reference) -> Result<Vec<Area>, CellError> {
         let range = r.range();
+        // Verto: a block of another workbook (`'[Book.xlsx]Sheet'!A1`) is noted for the host to
+        // fetch, whether or not its values are here yet.
+        if let SheetSel::Named(n) = &r.sheet
+            && n.starts_with('[')
+        {
+            self.host.workbook().linked.note(n, range);
+        }
         Ok(self.resolve_sheet(&r.sheet)?.into_iter().map(|sheet| Area { sheet, range }).collect())
     }
 

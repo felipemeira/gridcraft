@@ -6,6 +6,7 @@
 
 mod b64;
 pub mod cell;
+pub mod linked;
 mod cellmap;
 pub mod features;
 pub mod macros;

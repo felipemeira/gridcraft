@@ -280,6 +280,9 @@ pub struct Workbook {
     /// the links in memory are still written for the old one. Not in JSON.
     #[serde(skip)]
     pub source_path: Option<std::path::PathBuf>,
+    /// Verto: the values of other workbooks that formulas here point at, while open. Not saved.
+    #[serde(skip)]
+    pub linked: crate::linked::LinkedBooks,
 }
 
 fn is_all(s: &ShowObjects) -> bool {
@@ -372,16 +375,27 @@ impl Workbook {
             source_dir: None,
             region: gridcraft_core::region::default_region(),
             source_path: None,
+            linked: crate::linked::LinkedBooks::default(),
         }
     }
+    /// The sheet at `i`; from [`crate::linked::LINKED_BASE`] up, another workbook's sheet
+    /// (values only) that formulas here point at.
     pub fn sheet(&self, i: usize) -> Option<&Sheet> {
+        if i >= crate::linked::LINKED_BASE {
+            return self.linked.sheet(i - crate::linked::LINKED_BASE);
+        }
         self.sheets.get(i).map(|s| s.as_ref())
     }
     pub fn sheet_mut(&mut self, i: usize) -> Option<&mut Sheet> {
         self.sheets.get_mut(i).map(Arc::make_mut)
     }
+    /// The index of the sheet named `name`; `[Book]Sheet` names another workbook's linked sheet
+    /// (see [`Workbook::sheet`]).
     pub fn sheet_index(&self, name: &str) -> Option<usize> {
-        self.sheets.iter().position(|s| s.name.eq_ignore_ascii_case(name))
+        self.sheets
+            .iter()
+            .position(|s| s.name.eq_ignore_ascii_case(name))
+            .or_else(|| self.linked.index(name).map(|k| crate::linked::LINKED_BASE + k))
     }
     /// The index of the sheet the workbook's window shows (the file's active tab).
     pub fn active_sheet(&self) -> usize {

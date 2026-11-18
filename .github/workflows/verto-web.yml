@@ -46,8 +46,11 @@ jobs:
         run: |
           cargo test --locked -p gridcraft-core --lib regional
           cargo test --locked -p gridcraft-formula --lib pt_br
-      - name: Test co-editing
-        run: cargo test --locked -p gridcraft-engine --lib collab
+      - name: Test co-editing and linked workbooks
+        run: |
+          cargo test --locked -p gridcraft-engine --lib collab
+          cargo test --locked -p gridcraft-engine --lib linked_books
+          cargo test --locked -p gridcraft-model --lib
       - name: Measure co-editing (sizes and times)
         run: cargo test --locked --release -p gridcraft-engine --lib collab::tests::measure -- --ignored --nocapture
       - name: Build and zip
