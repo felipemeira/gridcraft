@@ -18,6 +18,8 @@
 //!   row and column. Values that formulas compute are not mirrored: each copy recalculates. A
 //!   formula keeps, beside its text, the ids of the lines each of its references points at, so a
 //!   formula typed while someone else inserts or deletes lines still points where it was meant;
+//! - empty cells that only have a format (borders, fills of a form), as rectangles of one format,
+//!   as Excel keeps them, rather than cell by cell;
 //! - row heights and column widths, merged areas, notes and comments, and hyperlinks, also under
 //!   the line ids;
 //! - the sheet's other settings (conditional formats, validation, tables, filters, charts,
@@ -58,7 +60,7 @@ const SHEET_ORDER: &str = "sheet-order";
 
 /// How the mirror is laid out. Someone with a GridCraft that lays it out otherwise can't join
 /// (a page left open from before an update): they are told to reload.
-const FORMAT: i64 = 4;
+const FORMAT: i64 = 5;
 
 fn err(e: impl std::fmt::Display) -> EngineError {
     EngineError::Other(format!("co-editing: {e}"))
@@ -363,6 +365,8 @@ pub enum Feature {
     Links(BTreeMap<CellRef, Hyperlink>),
     /// A setting (see `sheet_settings!`) and its JSON.
     Setting(String, String),
+    /// The empty cells that only have a format: rectangles and the style's JSON.
+    Blanks(Vec<(RangeRef, String)>),
 }
 
 /// The sheets as someone else left them: the order of their keys, with their names and where
@@ -441,11 +445,16 @@ impl Remote {
                     cx.sheet_mut(si)?.cols = cols;
                     continue;
                 }
+                Feature::Blanks(rects) => {
+                    let rects = blanks_from(rects, &mut cx.wb.styles);
+                    set_blanks(cx.sheet_mut(si)?, rects);
+                    continue;
+                }
                 f => f,
             };
             let sh = cx.sheet_mut(si)?;
             match feature {
-                Feature::Rows(_) | Feature::Cols(_) => {}
+                Feature::Rows(_) | Feature::Cols(_) | Feature::Blanks(_) => {}
                 Feature::Merges(merges) => sh.merges = merges,
                 Feature::Comments(comments) => sh.comments = comments,
                 Feature::Links(links) => sh.hyperlinks = links,
@@ -690,11 +699,17 @@ impl Collab {
                             self.write_cell(si, n, None, after)?;
                         }
                     }
+                    self.sync_blanks(si, a, after)?;
                     self.sync_features(si, a, Some(b), after)?;
                 }
                 Some(b) => {
+                    let mut blanks = false;
                     for c in b.cells.diff(&a.cells) {
+                        blanks |= b.cells.get(c).is_some_and(is_blank_styled) || a.cells.get(c).is_some_and(is_blank_styled);
                         self.write_cell(si, c, a.cells.get(c), after)?;
+                    }
+                    if blanks {
+                        self.sync_blanks(si, a, after)?;
                     }
                     self.sync_features(si, a, Some(b), after)?;
                 }
@@ -816,6 +831,8 @@ impl Collab {
     }
 
     fn write_cell(&self, si: usize, c: CellRef, cell: Option<&Cell>, wb: &Workbook) -> Result<()> {
+        // An empty cell with only a format is kept with the sheet's rectangles of formats.
+        let cell = cell.filter(|x| !is_blank_styled(x));
         let m = &self.sheets[si];
         let key = m.cell_key(c);
         let map = self.doc.get_map(part(&m.key, "cells").as_str());
@@ -840,6 +857,24 @@ impl Collab {
         put(&map, &format!("{key}{STYLE_SUFFIX}"), style)
     }
 
+    /// Writes the sheet's empty formatted cells as rectangles, dropping the ones gone.
+    fn sync_blanks(&self, si: usize, sh: &Sheet, wb: &Workbook) -> Result<()> {
+        let m = &self.sheets[si];
+        let map = self.doc.get_map(part(&m.key, "fmt").as_str());
+        let mut keep = HashSet::new();
+        for (r, st) in blank_rects(sh) {
+            let k = m.range_key(r);
+            put(&map, &k, self.style_key(wb, st)?)?;
+            keep.insert(k);
+        }
+        for k in map_keys(&map) {
+            if !keep.contains(&k) {
+                map.delete(&k).map_err(err)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes all of sheet `si` into the mirror and drops the entries of what is gone (or whose
     /// line was deleted): for a new sheet, and after a line insert or delete.
     fn sync_sheet(&self, si: usize, wb: &Workbook) -> Result<()> {
@@ -855,6 +890,7 @@ impl Collab {
                 map.delete(&k).map_err(err)?;
             }
         }
+        self.sync_blanks(si, sh, wb)?;
         self.sync_features(si, sh, None, wb)
     }
 
@@ -1088,13 +1124,17 @@ impl Collab {
             "notes" => vec![Feature::Comments(entries().filter_map(|(k, v)| Some((m.parse_key(&k)?, serde_json::from_str(&v).ok()?))).collect())],
             "links" => vec![Feature::Links(entries().filter_map(|(k, v)| Some((m.parse_key(&k)?, serde_json::from_str(&v).ok()?))).collect())],
             "settings" => entries().map(|(k, v)| Feature::Setting(k, v)).collect(),
+            "fmt" => {
+                let styles = self.doc.get_map("styles");
+                vec![Feature::Blanks(entries().filter_map(|(k, v)| Some((m.parse_range(&k)?, get_str(&styles, &v)?))).collect())]
+            }
             _ => vec![],
         }
     }
 
     /// Every part of sheet `si` the mirror holds.
     fn all_features(&self, si: usize) -> Vec<Feature> {
-        ["rowinfo", "colinfo", "merges", "notes", "links", "settings"].iter().flat_map(|k| self.feature(si, k)).collect()
+        ["rowinfo", "colinfo", "merges", "notes", "links", "settings", "fmt"].iter().flat_map(|k| self.feature(si, k)).collect()
     }
 
     fn sheet_of(&self, key: &str) -> Option<usize> {
@@ -1218,6 +1258,9 @@ impl Collab {
                 ("notes", _) => {
                     parts.insert((si, "notes"));
                 }
+                ("fmt", _) => {
+                    parts.insert((si, "fmt"));
+                }
                 ("links", _) => {
                     parts.insert((si, "links"));
                 }
@@ -1250,7 +1293,7 @@ impl Collab {
                 remote.lines.retain(|l| l.sheet != si);
                 cell_keys.remove(&si);
                 remote.rebuilt.push((si, self.all_cells(si)));
-                for kind in ["rowinfo", "colinfo", "merges", "notes", "links"] {
+                for kind in ["rowinfo", "colinfo", "merges", "notes", "links", "fmt"] {
                     parts.insert((si, kind));
                 }
             }
@@ -1320,7 +1363,65 @@ fn set_feature(sh: &mut Sheet, styles: &mut StyleTable, f: Feature) {
         Feature::Comments(comments) => sh.comments = comments,
         Feature::Links(links) => sh.hyperlinks = links,
         Feature::Setting(key, json) => apply_setting(sh, &key, &json),
+        Feature::Blanks(rects) => set_blanks(sh, blanks_from(rects, styles)),
     }
+}
+
+/// An empty cell that only has a format.
+fn is_blank_styled(cell: &Cell) -> bool {
+    cell.formula.is_none() && cell.py.is_none() && cell.value == Value::Empty && cell.style != StyleId::DEFAULT
+}
+
+/// A sheet's empty formatted cells as rectangles of one format: runs along each row, then runs
+/// that repeat in the rows below joined into one.
+fn blank_rects(sh: &Sheet) -> Vec<(RangeRef, StyleId)> {
+    // (first column, last column, style) -> (first row, last row) of the rectangle still open.
+    let mut open: HashMap<(u32, u32, StyleId), (u32, u32)> = HashMap::new();
+    let mut done: Vec<(RangeRef, StyleId)> = Vec::new();
+    let mut row_runs: Vec<(u32, u32, StyleId)> = Vec::new();
+    let mut row: Option<u32> = None;
+    let close_row = |r: u32, runs: &mut Vec<(u32, u32, StyleId)>, open: &mut HashMap<(u32, u32, StyleId), (u32, u32)>, done: &mut Vec<(RangeRef, StyleId)>| {
+        let mut next: HashMap<(u32, u32, StyleId), (u32, u32)> = HashMap::new();
+        for run in runs.drain(..) {
+            match open.remove(&run) {
+                Some((r0, last)) if last + 1 == r => {
+                    next.insert(run, (r0, r));
+                }
+                other => {
+                    if let Some((r0, last)) = other {
+                        done.push((RangeRef::new(CellRef::new(r0, run.0), CellRef::new(last, run.1)), run.2));
+                    }
+                    next.insert(run, (r, r));
+                }
+            }
+        }
+        for ((c0, c1, st), (r0, r1)) in open.drain() {
+            done.push((RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)), st));
+        }
+        *open = next;
+    };
+    for (c, cell) in sh.cells.iter() {
+        if !is_blank_styled(cell) {
+            continue;
+        }
+        if row != Some(c.row) {
+            if let Some(r) = row {
+                close_row(r, &mut row_runs, &mut open, &mut done);
+            }
+            row = Some(c.row);
+        }
+        match row_runs.last_mut() {
+            Some(last) if last.1 + 1 == c.col && last.2 == cell.style => last.1 = c.col,
+            _ => row_runs.push((c.col, c.col, cell.style)),
+        }
+    }
+    if let Some(r) = row {
+        close_row(r, &mut row_runs, &mut open, &mut done);
+    }
+    for ((c0, c1, st), (r0, r1)) in open {
+        done.push((RangeRef::new(CellRef::new(r0, c0), CellRef::new(r1, c1)), st));
+    }
+    done
 }
 
 fn line_of(c: &mut CellRef, axis: Axis) -> &mut u32 {
@@ -1395,6 +1496,30 @@ fn resolve_kind(m: &SheetMirror, kind: &RefKind, tokens: &[String]) -> Option<Op
         (RefKind::Cols(_, a0, _, a1), [c0, c1]) => (|| Some(RefKind::Cols(col(c0)?, *a0, col(c1)?, *a1)))(),
         _ => return None,
     })
+}
+
+/// The rectangles' styles added to the workbook's style table.
+fn blanks_from(rects: Vec<(RangeRef, String)>, styles: &mut StyleTable) -> Vec<(RangeRef, StyleId)> {
+    rects.into_iter().filter_map(|(r, j)| Some((r, styles.intern(serde_json::from_str::<Style>(&j).ok()?)))).collect()
+}
+
+/// Makes the sheet's empty formatted cells those of the rectangles; cells with something in them
+/// keep their own format.
+fn set_blanks(sh: &mut Sheet, rects: Vec<(RangeRef, StyleId)>) {
+    let gone: Vec<CellRef> = sh.cells.iter().filter(|(_, c)| is_blank_styled(c)).map(|(c, _)| c).collect();
+    for c in gone {
+        sh.cells.remove(c);
+    }
+    for (r, st) in rects {
+        for row in r.start.row..=r.end.row {
+            for col in r.start.col..=r.end.col {
+                let at = CellRef::new(row, col);
+                if sh.cells.get(at).is_none() {
+                    sh.cells.set(at, Cell::styled(Value::Empty, st));
+                }
+            }
+        }
+    }
 }
 
 fn new_undo(doc: &LoroDoc) -> Arc<std::sync::Mutex<UndoManager>> {
@@ -1964,6 +2089,29 @@ mod tests {
             wb.sheets[0].rows.get(&2).and_then(|li| li.style).map(|st| wb.styles.get(st).font.bold)
         };
         assert_eq!(bold(&b), bold(&a));
+    }
+
+    #[test]
+    fn a_formatted_empty_area_goes_as_one_rectangle() {
+        let (mut a, mut b) = pair();
+        a.execute("home.bold", json!({"range": "D5:F200"})).unwrap();
+        pass(&mut a, &mut b);
+        let bold = |s: &Session, cell: &str| {
+            let wb = &s.doc().unwrap().wb;
+            wb.sheets[0].cells.get(CellRef::parse(cell).unwrap()).is_some_and(|c| wb.styles.get(c.style).font.bold)
+        };
+        assert!(bold(&a, "E100"));
+        assert!(bold(&b, "D5") && bold(&b, "E100") && bold(&b, "F200"));
+        assert!(!bold(&b, "G5") && !bold(&b, "D4"));
+        let c = b.doc().unwrap().collab.as_ref().unwrap();
+        let rects = c.doc.get_map(part(&c.sheets[0].key, "fmt").as_str()).len();
+        assert_eq!(rects, 1, "one rectangle for the whole area");
+        // Typing in it keeps the format around; clearing the format of a part splits it.
+        set(&mut b, "E50", "x");
+        b.execute("edit.clearFormats", json!({"range": "D10:F10"})).unwrap();
+        pass(&mut b, &mut a);
+        assert!(bold(&a, "D9") && !bold(&a, "E10") && bold(&a, "F11"));
+        assert_eq!(shown(&a, "E50"), Value::Text("x".into()));
     }
 
     #[test]
