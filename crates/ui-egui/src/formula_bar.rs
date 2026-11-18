@@ -488,10 +488,17 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         return python_editor(app, ui, id, width, max_height);
     }
     let Some(mut ed) = app.editor.take() else { return EditorInfo::default() };
-    let mine = ed.from_formula_bar == (id == egui::Id::unique("gridcraft.formula_bar"));
+    let in_bar = id == egui::Id::unique("gridcraft.formula_bar");
+    // Pointing at a cell of another sheet, the cell's own editor isn't drawn (it stays on the sheet
+    // the edit started on): the formula bar takes Enter, Tab and Esc then, as Excel's does, and
+    // Enter enters the formula and goes back to that sheet.
+    let away = app.view_key() != Some((ed.doc, ed.sheet));
+    let mine = ed.from_formula_bar == in_bar || (in_bar && away);
     // Keys the editor handles itself (before the TextEdit sees them), only where it has focus.
     let focused = ui.ctx().memory(|m| m.focused());
-    let has_focus = focused == Some(id) || (mine && (ed.request_focus || focused.is_none()));
+    // Pointing at another sheet the click on its tab or cell may hold the focus: the edit still
+    // owns the keys there.
+    let has_focus = focused == Some(id) || (mine && (ed.request_focus || focused.is_none() || away));
     let EditorKeyOutcome { action, arrow, cancel, to_python } = editor_shortcuts(app, ui, id, &mut ed, mine, has_focus);
     // The text widget.
     let refs = formula_refs(&ed.text);
