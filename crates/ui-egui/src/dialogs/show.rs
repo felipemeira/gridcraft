@@ -338,16 +338,19 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                     }
                 }
                 "saveChanges" => {
-                    ui.label(format!("Do you want to save the changes you made to {}?", d.values.get("title").and_then(Json::as_str).unwrap_or("this workbook")));
+                    let lang = app.ui.language;
+                    let title = d.values.get("title").and_then(Json::as_str).unwrap_or(lang.tr("this workbook")).to_string();
+                    ui.label(lang.tr("Do you want to save the changes you made to {title}?").replace("{title}", &title));
                     let quitting = d.values.get("quit").and_then(Json::as_bool) == Some(true);
                     let host = d.values.get("host").and_then(Json::as_bool) == Some(true);
                     ui.horizontal(|ui| {
                         for (label, answer) in
                             [("Don't Save", crate::SaveAnswer::DontSave), ("Cancel", crate::SaveAnswer::Cancel), ("Save", crate::SaveAnswer::Save)]
                         {
-                            if !ui.button(label).clicked() {
+                            if !ui.button(lang.tr(label)).clicked() {
                                 continue;
                             }
+                            ui.ctx().request_repaint();
                             let settled = if host { app.answer_host_close(answer) } else { app.answer_save_changes(answer, quitting, ui.ctx()) };
                             if settled {
                                 open = false;

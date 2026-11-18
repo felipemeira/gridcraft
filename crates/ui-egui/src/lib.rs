@@ -325,6 +325,9 @@ pub struct SheetApp {
     /// Every unsaved workbook has been answered for quitting (or `app.quit` asked): the next
     /// window close goes through.
     pub allow_close: bool,
+    /// Verto: frames left to wait, after Save in the Close question, for the host bridge to mark
+    /// the workbook saved (it does at the end of the frame) before handing it back.
+    pub(crate) host_close_pending: u8,
     /// Linux/BSD: the window has no system frame; the title bar draws minimize, maximize and
     /// close, and the window resizes from its edges (`ribbon::window_frame`).
     pub window_controls: bool,

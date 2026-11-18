@@ -79,6 +79,7 @@ impl SheetApp {
             macros: macro_ui::MacroUi::default(),
             started: now_ms(),
             allow_close: false,
+            host_close_pending: 0,
             window_controls: false,
             viewport_commands: Vec::new(),
             bring_forward: false,
@@ -141,6 +142,7 @@ impl SheetApp {
         // frames still see worker completion. `ui` and the desktop app no longer poll it.
         self.poll_printing(ctx);
         self.guard_window_close(ctx);
+        self.finish_host_close(ctx);
         #[cfg(not(target_arch = "wasm32"))]
         updates_ui::tick(self, ctx);
         // Files read asynchronously (web file picker, dropped files).

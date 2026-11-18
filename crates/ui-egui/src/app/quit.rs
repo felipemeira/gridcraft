@@ -113,14 +113,27 @@ impl SheetApp {
                     return false;
                 }
                 self.run_or_alert("file.save", json!({}));
-                if self.session.active().is_some_and(|d| d.is_dirty()) {
-                    return false;
-                }
-                if let Some(close) = &self.services.close_document {
-                    close();
-                }
+                // The host bridge marks it saved at the end of this frame: the close follows then.
+                self.host_close_pending = 5;
                 true
             }
+        }
+    }
+
+    /// After Save in the Close question: hands the workbook back once the host has it (it is
+    /// clean). A save that didn't reach the host keeps it open (the wait ends after a few frames).
+    pub(super) fn finish_host_close(&mut self, ctx: &egui::Context) {
+        if self.host_close_pending == 0 {
+            return;
+        }
+        self.host_close_pending -= 1;
+        if self.session.active().is_some_and(|d| !d.is_dirty()) {
+            self.host_close_pending = 0;
+            if let Some(close) = &self.services.close_document {
+                close();
+            }
+        } else {
+            ctx.request_repaint();
         }
     }
 
