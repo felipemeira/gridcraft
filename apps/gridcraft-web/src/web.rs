@@ -7,6 +7,7 @@ use wasm_bindgen::JsValue;
 
 mod collab;
 mod dictionaries;
+mod fonts;
 
 const CANVAS_ID: &str = "gridcraft_canvas";
 const LOADING_ID: &str = "gridcraft_loading";
@@ -25,6 +26,8 @@ pub fn start() {
         };
         // Spelling dictionaries the site serves (`dictionaries/`), before the first workbook.
         dictionaries::load_all().await;
+        // Verto: the cell fonts the site serves (`fonts/`), so bold and italic cells draw as such.
+        fonts::load_all().await;
         let mut options = eframe::WebOptions::default();
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_options.wgpu_setup {
             let default_descriptor = std::sync::Arc::clone(&setup.device_descriptor);

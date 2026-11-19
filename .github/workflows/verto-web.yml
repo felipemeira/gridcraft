@@ -19,6 +19,9 @@ concurrency:
 env:
   # LibreOffice/dictionaries commit the pt_BR files are taken from (the same as WordCraft's).
   DICT_REF: 1e848fbddd7fd8e03fb696ecc03ee1068fab141c
+  # google/fonts commit Carlito (SIL OFL 1.1, Calibri's metrics) is taken from: the cell fonts the
+  # web app fetches from fonts/ (a browser has no system fonts, so bold and italic need them).
+  FONTS_REF: 605c9f29dd5770762bd7ee8ea8ac4ae7664b2b7b
 
 jobs:
   web:
@@ -55,7 +58,7 @@ jobs:
         run: cargo test --locked --release -p gridcraft-engine --lib collab::tests::measure -- --ignored --nocapture
       - name: Build and zip
         run: packaging/web/package.sh
-      - name: Add the pt_BR dictionary
+      - name: Add the pt_BR dictionary and the cell fonts
         run: |
           set -euo pipefail
           mkdir -p out
@@ -70,6 +73,12 @@ jobs:
           sed -i '1s/^\xEF\xBB\xBF//' "$site/dictionaries/pt_BR.aff" "$site/dictionaries/pt_BR.dic"
           head -1 "$site/dictionaries/pt_BR.aff"
           ls -l "$site/dictionaries"
+          mkdir -p "$site/fonts"
+          base="https://raw.githubusercontent.com/google/fonts/$FONTS_REF/ofl/carlito"
+          for f in Carlito-Regular.ttf Carlito-Bold.ttf Carlito-Italic.ttf Carlito-BoldItalic.ttf OFL.txt; do
+            curl --proto '=https' -fsSL -o "$site/fonts/$f" "$base/$f"
+          done
+          ls -l "$site/fonts"
           echo "SITE=$site" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

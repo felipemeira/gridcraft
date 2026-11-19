@@ -544,6 +544,25 @@ pub(super) fn font_definitions_impl(
     fonts
 }
 
+/// Verto (web): cell faces a site serves beside the app, for browsers, which have no system fonts
+/// to load: without them a bold or italic cell is drawn in the regular face. Registered by role
+/// (`cell`, `cell-bold`, `cell-italic`, `cell-bold-italic`) before the app starts.
+static SERVED_CELL_FACES: std::sync::Mutex<Vec<(&'static str, Arc<Vec<u8>>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers a cell face the site serves (see [`SERVED_CELL_FACES`]); a later one for the same role
+/// replaces it. Faces that don't parse are left out when the font set is built.
+pub fn register_served_cell_face(role: &'static str, bytes: Vec<u8>) {
+    let mut faces = SERVED_CELL_FACES.lock().unwrap_or_else(|e| e.into_inner());
+    faces.retain(|(r, _)| *r != role);
+    faces.push((role, Arc::new(bytes)));
+}
+
+fn served_cell_face(role: &str) -> Option<FontData> {
+    let faces = SERVED_CELL_FACES.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = faces.iter().find(|(r, _)| *r == role)?.1.clone();
+    font_parses(&bytes, 0).then(|| FontData::from_owned((*bytes).clone()))
+}
+
 /// Builds one role family's chain: the loaded system face (or its role fallback), egui's bundled
 /// proportional/monospace base, Hack's symbols, then the script fallbacks. Keys without font data
 /// are dropped, as before.
@@ -559,7 +578,7 @@ fn build_role_chain(
     let paths = candidates(role);
     let refs: Vec<(&str, u32)> = paths.iter().map(|(p, i)| (p.as_str(), *i)).collect();
     let mut chain: Vec<String> = Vec::new();
-    let loaded = if system { try_load(&refs) } else { None };
+    let loaded = if system { try_load(&refs) } else { None }.or_else(|| if system { served_cell_face(role) } else { None });
     if let Some(mut fd) = loaded {
         // Helvetica Neue Bold's own TrueType hints close Cyrillic е into ө at 13 pt on a Retina
         // screen (#1184). Core Text never runs them, so this draws it the way macOS does.
