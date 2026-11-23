@@ -487,3 +487,27 @@ fn kept_sheet_geometry_and_cf_statistics_follow_every_change() {
     assert!(!Arc::ptr_eq(&kept(&app).0, &ri));
     check_cf(&mut app);
 }
+
+/// Verto: a Chrome wheel click (100 px) is one notch, whether it comes as Ctrl+wheel or, when the
+/// page missed the Ctrl key, as eframe's pinch zoom (e^1, which was five notches); a small pinch
+/// step keeps its size, and plain scrolling isn't zoom.
+#[test]
+fn a_browser_wheel_click_is_one_notch_at_most() {
+    use super::show::browser_event_notches;
+    let (speed, line) = (1.0 / 200.0, 40.0);
+    let wheel = |dy: f32, ctrl: bool| egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta: egui::vec2(0.0, dy),
+        modifiers: egui::Modifiers { ctrl, ..Default::default() },
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+    };
+    assert_eq!(browser_event_notches(&wheel(100.0, true), speed, line), Some(1.0));
+    assert_eq!(browser_event_notches(&wheel(-100.0, true), speed, line), Some(-1.0));
+    assert_eq!(browser_event_notches(&wheel(-100.0, false), speed, line), None);
+    assert_eq!(browser_event_notches(&egui::Event::Zoom(1f32.exp()), speed, line), Some(1.0));
+    assert_eq!(browser_event_notches(&egui::Event::Zoom((-1f32).exp()), speed, line), Some(-1.0));
+    let pinch = browser_event_notches(&egui::Event::Zoom(0.05f32.exp()), speed, line).unwrap();
+    assert!((pinch - 0.25).abs() < 1e-4, "{pinch}");
+    assert_eq!(browser_event_notches(&egui::Event::Zoom(1.0), speed, line), None);
+}

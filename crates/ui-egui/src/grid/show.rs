@@ -398,33 +398,40 @@ fn show_grid_interactions(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Re
 /// Verto: this frame's Ctrl+wheel turn in notches, read from the browser's own events. A browser
 /// sends one wheel notch as 100 pixels (Chrome, Edge) or 3 lines (Firefox), which egui reads as
 /// 2.5 to 3 notches and eases in over several frames, so one click jumped two or three zoom steps.
-/// Here each wheel event counts as one notch at most, and a touchpad pinch (which eframe sends as
-/// `Event::Zoom`) as egui reads it. `None` when nothing was turned this frame, so the frames egui
-/// eases a notch over don't count again.
+/// Here each event counts as one notch at most (see [`browser_event_notches`]). `None` when nothing
+/// was turned this frame, so the frames egui eases a notch over don't count again.
 #[cfg(target_arch = "wasm32")]
 fn browser_zoom_notches(ui: &egui::Ui, zoom_speed: f32, line_speed: f32) -> Option<f32> {
-    let notch_points = line_speed.max(1.0);
     ui.input(|i| {
         let mut turned = None::<f32>;
-        for e in &i.events {
-            let n = match e {
-                egui::Event::MouseWheel { unit, delta, modifiers, .. } if modifiers.command || modifiers.ctrl => {
-                    let points = match unit {
-                        egui::MouseWheelUnit::Point => delta.x + delta.y,
-                        egui::MouseWheelUnit::Line => (delta.x + delta.y) * notch_points,
-                        egui::MouseWheelUnit::Page => (delta.x + delta.y).signum() * notch_points,
-                    };
-                    (points / notch_points).clamp(-1.0, 1.0)
-                }
-                egui::Event::Zoom(factor) => factor.ln() / (zoom_speed * notch_points),
-                _ => continue,
-            };
-            if n.is_finite() && n != 0.0 {
-                *turned.get_or_insert(0.0) += n;
-            }
+        for n in i.events.iter().filter_map(|e| browser_event_notches(e, zoom_speed, line_speed)) {
+            *turned.get_or_insert(0.0) += n;
         }
         turned
     })
+}
+
+/// Verto: the zoom notches one browser event turns, at most one either way. A Ctrl+wheel event
+/// arrives as `MouseWheel` when the page saw Ctrl go down, and otherwise (the sheet had no keyboard
+/// focus yet, as when it has just opened inside the Verto page) as `Event::Zoom`, eframe's touchpad
+/// pinch: e^(0.01 × 100 px), which egui's speed reads as five notches, so two or three clicks went
+/// down to 10%. A real pinch sends many small events, each well under a notch.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(super) fn browser_event_notches(e: &egui::Event, zoom_speed: f32, line_speed: f32) -> Option<f32> {
+    let notch_points = line_speed.max(1.0);
+    let n = match e {
+        egui::Event::MouseWheel { unit, delta, modifiers, .. } if modifiers.command || modifiers.ctrl => {
+            let points = match unit {
+                egui::MouseWheelUnit::Point => delta.x + delta.y,
+                egui::MouseWheelUnit::Line => (delta.x + delta.y) * notch_points,
+                egui::MouseWheelUnit::Page => (delta.x + delta.y).signum() * notch_points,
+            };
+            points / notch_points
+        }
+        egui::Event::Zoom(factor) => factor.ln() / (zoom_speed * notch_points),
+        _ => return None,
+    };
+    (n.is_finite() && n != 0.0).then(|| n.clamp(-1.0, 1.0))
 }
 
 fn update_zoom_glide(app: &mut SheetApp, ui: &egui::Ui, place: (u64, usize), zoom: u16, now: f64) {
