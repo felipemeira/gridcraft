@@ -84,11 +84,17 @@ pub fn show(app: &mut SheetApp, ui: &mut egui::Ui) {
     };
     // Scrolling.
     let (scroll_delta, zoom_delta, modifiers, now) = ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.modifiers, i.time));
+    // egui's zoom factor is e^(speed × points); one notch is `line_scroll_speed` points.
+    let (zoom_speed, line_speed) = ui.ctx().options(|o| (o.input_options.scroll_zoom_speed, o.input_options.line_scroll_speed));
+    #[cfg(not(target_arch = "wasm32"))]
+    let zoom_turn = (zoom_delta != 1.0).then(|| zoom_delta.ln() / (zoom_speed * line_speed));
+    #[cfg(target_arch = "wasm32")]
+    let zoom_turn = {
+        let _ = zoom_delta;
+        browser_zoom_notches(ui, zoom_speed, line_speed)
+    };
     if (resp.hovered() || resp.contains_pointer()) && !crate::text_box::contains_pointer(app, ui.ctx()) {
-        if zoom_delta != 1.0 {
-            // egui's zoom factor is e^(speed × points); one notch is `line_scroll_speed` points.
-            let notch = ui.ctx().options(|o| o.input_options.scroll_zoom_speed * o.input_options.line_scroll_speed);
-            let turned = zoom_delta.ln() / notch;
+        if let Some(turned) = zoom_turn {
             let mut zooming = WheelZoom::at(app, place, sh.zoom, now);
             if now - zooming.time > WHEEL_ZOOM_IDLE {
                 zooming.notches = 0.0;
@@ -387,6 +393,38 @@ fn show_grid_interactions(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Re
     fill_options_tag(app, ui, geo, sh);
     object_menu(app, ui);
     error_check_tag(app, ui, geo, sh);
+}
+
+/// Verto: this frame's Ctrl+wheel turn in notches, read from the browser's own events. A browser
+/// sends one wheel notch as 100 pixels (Chrome, Edge) or 3 lines (Firefox), which egui reads as
+/// 2.5 to 3 notches and eases in over several frames, so one click jumped two or three zoom steps.
+/// Here each wheel event counts as one notch at most, and a touchpad pinch (which eframe sends as
+/// `Event::Zoom`) as egui reads it. `None` when nothing was turned this frame, so the frames egui
+/// eases a notch over don't count again.
+#[cfg(target_arch = "wasm32")]
+fn browser_zoom_notches(ui: &egui::Ui, zoom_speed: f32, line_speed: f32) -> Option<f32> {
+    let notch_points = line_speed.max(1.0);
+    ui.input(|i| {
+        let mut turned = None::<f32>;
+        for e in &i.events {
+            let n = match e {
+                egui::Event::MouseWheel { unit, delta, modifiers, .. } if modifiers.command || modifiers.ctrl => {
+                    let points = match unit {
+                        egui::MouseWheelUnit::Point => delta.x + delta.y,
+                        egui::MouseWheelUnit::Line => (delta.x + delta.y) * notch_points,
+                        egui::MouseWheelUnit::Page => (delta.x + delta.y).signum() * notch_points,
+                    };
+                    (points / notch_points).clamp(-1.0, 1.0)
+                }
+                egui::Event::Zoom(factor) => factor.ln() / (zoom_speed * notch_points),
+                _ => continue,
+            };
+            if n.is_finite() && n != 0.0 {
+                *turned.get_or_insert(0.0) += n;
+            }
+        }
+        turned
+    })
 }
 
 fn update_zoom_glide(app: &mut SheetApp, ui: &egui::Ui, place: (u64, usize), zoom: u16, now: f64) {

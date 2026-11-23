@@ -60,10 +60,10 @@ pub const COL_HEADER_H: f32 = 21.0;
 /// which matches desktop spreadsheet density (a default 20 px row is 16 pt tall).
 pub const DISPLAY_SCALE: f32 = 0.8;
 
-/// The zoom percentages a Ctrl+wheel notch steps between: four per doubling (about 20% apart),
-/// so 25, 50, 100, 200 and 400 are on it. Excel steps 15 points a notch instead; the status bar's
-/// Zoom In / Zoom Out buttons keep their 10% steps.
-pub const WHEEL_ZOOM_LADDER: [u16; 22] = [10, 12, 15, 18, 21, 25, 30, 35, 42, 50, 60, 70, 85, 100, 120, 140, 170, 200, 240, 280, 340, 400];
+/// The zoom percentages a Ctrl+wheel notch steps between. Verto: 10 points apart from 50% to
+/// 150%, where a sheet is read (about 20% apart steps grew too fast), and wider beyond; 25, 50,
+/// 100, 200 and 400 are on it. The status bar's Zoom In / Zoom Out buttons keep their 10% steps.
+pub const WHEEL_ZOOM_LADDER: [u16; 22] = [10, 15, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 175, 200, 250, 300, 400];
 
 /// Seconds without Ctrl+wheel input after which part of a notch turned so far is forgotten.
 const WHEEL_ZOOM_IDLE: f64 = 0.75;

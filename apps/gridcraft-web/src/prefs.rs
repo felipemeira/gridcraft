@@ -32,6 +32,19 @@ pub fn restore(app: &mut SheetApp, ui: Option<&str>, prefs: Option<&str>) {
     }
 }
 
+/// Verto: the `localStorage` key that says [`verto_interface_size`] has been applied in this browser.
+pub const VERTO_SIZE_KEY: &str = "verto.gridcraft.tamanhoInterface";
+/// Verto: the interface size the editor starts with (the ribbon's icons were hard to see at 100%).
+pub const VERTO_INTERFACE_SIZE: u16 = 110;
+
+/// Verto: start at [`VERTO_INTERFACE_SIZE`] once per browser, over Auto only: a size the user
+/// chose stays, and choosing Auto afterwards is kept too (the caller stores [`VERTO_SIZE_KEY`]).
+pub fn verto_interface_size(app: &mut SheetApp) {
+    if app.ui.interface_scale == 100 {
+        app.ui.interface_scale = VERTO_INTERFACE_SIZE;
+    }
+}
+
 /// Tracks what was last written, so the store is written only when a preference changed.
 #[derive(Default)]
 pub struct PrefsSync {
@@ -146,6 +159,25 @@ mod tests {
         assert_eq!(a.ui.language, Language::De);
         restore(&mut a, Some(r#"{"language":"fr"}"#), None);
         assert_eq!(a.ui.language, Language::Fr);
+    }
+
+    /// Verto: 110% over Auto, stored like any other preference; a chosen size is left alone.
+    #[test]
+    fn verto_starts_at_110_percent_over_auto_only() {
+        let mut fresh = app();
+        restore(&mut fresh, None, None);
+        verto_interface_size(&mut fresh);
+        assert_eq!(fresh.ui.interface_scale, 110);
+        let mut sync = PrefsSync::new(None, None);
+        let ui = stored(&sync.changed(&fresh), UI_KEY).expect("stored");
+        let mut reloaded = app();
+        restore(&mut reloaded, Some(&ui), None);
+        assert_eq!(reloaded.ui.interface_scale, 110);
+
+        let mut chosen = app();
+        chosen.run("view.interfaceScale", json!({"percent": 150})).unwrap();
+        verto_interface_size(&mut chosen);
+        assert_eq!(chosen.ui.interface_scale, 150);
     }
 
     #[test]

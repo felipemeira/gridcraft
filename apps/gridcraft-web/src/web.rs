@@ -118,6 +118,14 @@ pub fn start() {
                     // and `prefs.json`; a saved language replaces the browser's.
                     let (stored_ui, stored_prefs) = (stored(crate::prefs::UI_KEY), stored(crate::prefs::PREFS_KEY));
                     crate::prefs::restore(&mut app, stored_ui.as_deref(), stored_prefs.as_deref());
+                    // Verto: the interface starts at 110%, once per browser (a size chosen later,
+                    // Auto included, is kept). Written with the preferences on the first frame.
+                    if stored(crate::prefs::VERTO_SIZE_KEY).is_none() {
+                        crate::prefs::verto_interface_size(&mut app);
+                        if let Some(store) = local_storage() {
+                            let _ = store.set_item(crate::prefs::VERTO_SIZE_KEY, "110");
+                        }
+                    }
                     let mut prefs = crate::prefs::PrefsSync::new(stored_ui, stored_prefs);
                     SheetApp::setup_context_for_language(&cc.egui_ctx, false, app.ui.language);
                     // Brazilian regional settings (Verto's build): numbers, dates, TEXT codes and

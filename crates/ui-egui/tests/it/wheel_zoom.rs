@@ -84,23 +84,23 @@ fn with_animations_the_zoom_glides_to_the_step() {
     let mut h = animated();
     let seen = turn_and_watch(&mut h, 1.0, 40);
     assert!(seen.windows(2).all(|w| w[0] <= w[1]), "only ever towards the step: {seen:?}");
-    let between = seen.iter().filter(|&&z| z > 100 && z < 120).count();
+    let between = seen.iter().filter(|&&z| z > 100 && z < 110).count();
     assert!(between >= 3, "on its way over several frames: {seen:?}");
-    assert_eq!(seen.last(), Some(&120), "and exactly on the step: {seen:?}");
+    assert_eq!(seen.last(), Some(&110), "and exactly on the step: {seen:?}");
     let seen = turn_and_watch(&mut h, -1.0, 40);
-    assert!(seen.windows(2).all(|w| w[0] >= w[1]) && seen.iter().any(|&z| z > 100 && z < 120), "{seen:?}");
+    assert!(seen.windows(2).all(|w| w[0] >= w[1]) && seen.iter().any(|&z| z > 100 && z < 110), "{seen:?}");
     assert_eq!(seen.last(), Some(&100), "{seen:?}");
 }
 
 #[test]
 fn a_notch_during_a_glide_steps_on_from_where_it_is_going() {
     let mut h = animated();
-    let seen = turn_and_watch(&mut h, 1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 100 && z < 120), "still gliding: {seen:?}");
+    let seen = turn_and_watch(&mut h, 1.0, 3);
+    assert!(seen.last().is_some_and(|&z| z > 100 && z < 110), "still gliding: {seen:?}");
     turn_and_watch(&mut h, 1.0, 60);
-    assert_eq!(zoom(&h), 140);
-    let seen = turn_and_watch(&mut h, -1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 120 && z < 140), "{seen:?}");
+    assert_eq!(zoom(&h), 120);
+    let seen = turn_and_watch(&mut h, -1.0, 3);
+    assert!(seen.last().is_some_and(|&z| z > 110 && z < 120), "{seen:?}");
     turn_and_watch(&mut h, -1.0, 60);
     assert_eq!(zoom(&h), 100);
 }
@@ -108,8 +108,8 @@ fn a_notch_during_a_glide_steps_on_from_where_it_is_going() {
 #[test]
 fn a_zoom_set_another_way_stops_a_glide() {
     let mut h = animated();
-    let seen = turn_and_watch(&mut h, 1.0, 6);
-    assert!(seen.last().is_some_and(|&z| z > 100 && z < 120), "{seen:?}");
+    let seen = turn_and_watch(&mut h, 1.0, 3);
+    assert!(seen.last().is_some_and(|&z| z > 100 && z < 110), "{seen:?}");
     h.state_mut().run("view.zoom", json!({"percent": 150})).unwrap();
     h.run_steps(60);
     assert_eq!(zoom(&h), 150);
@@ -125,8 +125,8 @@ fn with_view_animations_off_a_notch_steps_at_once() {
     let mut h = animated();
     h.state_mut().run("view.animations", json!({"on": false})).unwrap();
     let seen = turn_and_watch(&mut h, 1.0, 40);
-    assert!(seen.iter().all(|&z| z == 100 || z == 120), "no percentages in between: {seen:?}");
-    assert_eq!(seen.last(), Some(&120));
+    assert!(seen.iter().all(|&z| z == 100 || z == 110), "no percentages in between: {seen:?}");
+    assert_eq!(seen.last(), Some(&110));
 }
 
 #[test]
@@ -136,21 +136,21 @@ fn a_notch_out_returns_to_the_zoom_before_the_notch_in() {
     // Multiplying the rounded zoom by egui's eased factor every frame drifted: 100 → 122 → 101 → 123 → 102.
     for _ in 0..4 {
         wheel(&mut h, 1.0);
-        assert_eq!(zoom(&h), 120);
+        assert_eq!(zoom(&h), 110);
         wheel(&mut h, -1.0);
         assert_eq!(zoom(&h), 100);
     }
-    for expect in [120, 140, 170] {
+    for expect in [110, 120, 130] {
         wheel(&mut h, 1.0);
         assert_eq!(zoom(&h), expect);
     }
     wheel(&mut h, -3.0);
     assert_eq!(zoom(&h), 100);
     wheel(&mut h, -2.0);
-    assert_eq!(zoom(&h), 70);
+    assert_eq!(zoom(&h), 80);
     // Notches turned quickly, each before the last one has eased in.
     wheel_turns(&mut h, &[1.0, 1.0, 1.0, 1.0], 3);
-    assert_eq!(zoom(&h), 140);
+    assert_eq!(zoom(&h), 120);
     wheel_turns(&mut h, &[-1.0, -1.0], 3);
     assert_eq!(zoom(&h), 100);
 }
@@ -160,11 +160,11 @@ fn parts_of_a_notch_add_up_to_whole_steps() {
     // A fine-grained wheel (or a Windows touchpad pinch) sends a notch in pieces, not always evenly.
     let mut h = harness();
     wheel_turns(&mut h, &[0.25, 0.25, 0.25], 4);
-    assert_eq!(zoom(&h), 120, "three quarters of a notch step");
+    assert_eq!(zoom(&h), 110, "three quarters of a notch step");
     wheel_turns(&mut h, &[-0.3, -0.4, -0.3], 4);
     assert_eq!(zoom(&h), 100);
     wheel_turns(&mut h, &[0.25, 0.25, 0.25, 0.25, 0.3, 0.4, 0.3], 4);
-    assert_eq!(zoom(&h), 140, "one step per notch, however it's divided");
+    assert_eq!(zoom(&h), 120, "one step per notch, however it's divided");
     wheel_turns(&mut h, &[-0.5, -0.25, -0.25, -0.25, -0.25, -0.5], 4);
     assert_eq!(zoom(&h), 100);
     wheel_turns(&mut h, &[0.5], 4);
@@ -179,16 +179,16 @@ fn parts_of_a_notch_add_up_to_whole_steps() {
 fn from_a_zoom_set_another_way_a_notch_goes_to_the_next_step_or_100() {
     let mut h = harness();
     for (from, notches, to) in
-        [(112, 1.0, 120), (112, -1.0, 100), (121, -1.0, 100), (99, 1.0, 100), (101, -1.0, 100), (385, 1.0, 400), (400, 1.0, 400), (11, -1.0, 10)]
+        [(112, 1.0, 120), (112, -1.0, 100), (121, -1.0, 110), (99, 1.0, 100), (101, -1.0, 100), (385, 1.0, 400), (400, 1.0, 400), (11, -1.0, 10)]
     {
         set_zoom(&mut h, from);
         wheel(&mut h, notches);
         assert_eq!(zoom(&h), to, "{from}% by {notches}");
     }
-    // Two notches out from 121%: 100%, then 85%.
+    // Two notches out from 121%: 110%, then 100%.
     set_zoom(&mut h, 121);
     wheel(&mut h, -2.0);
-    assert_eq!(zoom(&h), 85);
+    assert_eq!(zoom(&h), 100);
 }
 
 /// One notch in `unit`: a line event or its equivalent in points (egui's 40-point line speed).
@@ -224,36 +224,36 @@ fn gesture(h: &mut Harness, source: MouseWheelSource, delta: f32, frames: usize)
 }
 
 #[test]
-/// A 40-point notch follows the same monotonic ladder and reaches 120%.
+/// A 40-point notch follows the same monotonic ladder and reaches 110%.
 fn point_units_use_the_same_zoom_ladder_as_lines() {
     let mut h = animated();
-    // egui converts a line to 40 points (native); the same physical notch must reach 120%.
+    // egui converts a line to 40 points (native); the same physical notch must reach 110%.
     let seen = turn_in_unit(&mut h, MouseWheelUnit::Point, vec2(0.0, 40.0), 40);
     assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{seen:?}");
-    assert_eq!(seen.last(), Some(&120), "{seen:?}");
+    assert_eq!(seen.last(), Some(&110), "{seen:?}");
 }
 
 #[test]
-/// Trackpad and momentum sources follow the same monotonic ladder to 120%.
+/// Trackpad and momentum sources follow the same monotonic ladder to 110%.
 fn trackpad_and_momentum_sources_keep_the_notch_ladder() {
     for source in [MouseWheelSource::Trackpad, MouseWheelSource::Momentum] {
         let mut h = animated();
         let seen = gesture(&mut h, source, 40.0, 40);
         assert!(seen.windows(2).all(|w| w[0] <= w[1]), "{source:?}: {seen:?}");
-        assert_eq!(seen.last(), Some(&120), "{source:?}: {seen:?}");
+        assert_eq!(seen.last(), Some(&110), "{source:?}: {seen:?}");
     }
 }
 
 #[test]
-/// A missing touch End is released by the idle timeout, so the next gesture still reaches 140%.
+/// A missing touch End is released by the idle timeout, so the next gesture still reaches 120%.
 fn a_trackpad_gesture_without_an_end_still_steps_on_after_the_idle_timeout() {
     let mut h = animated();
     let first = gesture(&mut h, MouseWheelSource::Trackpad, 40.0, 40);
-    assert_eq!(first.last(), Some(&120), "{first:?}");
+    assert_eq!(first.last(), Some(&110), "{first:?}");
     // No `TouchPhase::End` arrives; egui's scroll-action timeout must still release the gesture.
     h.run_steps(60);
     let second = gesture(&mut h, MouseWheelSource::Trackpad, 40.0, 40);
-    assert_eq!(second.last(), Some(&140), "a stale trackpad gesture must not swallow the next notch: {second:?}");
+    assert_eq!(second.last(), Some(&120), "a stale trackpad gesture must not swallow the next notch: {second:?}");
 }
 
 #[test]

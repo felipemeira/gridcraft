@@ -54,6 +54,11 @@ jobs:
           cargo test --locked -p gridcraft-engine --lib collab
           cargo test --locked -p gridcraft-engine --lib linked_books
           cargo test --locked -p gridcraft-model --lib
+      - name: Test the zoom steps and the interface size
+        run: |
+          cargo test --locked -p gridcraft-ui-egui --lib grid::tests
+          cargo test --locked -p gridcraft-ui-egui --test it wheel_zoom
+          cargo test --locked -p gridcraft-web --bin gridcraft-web prefs
       - name: Measure co-editing (sizes and times)
         run: cargo test --locked --release -p gridcraft-engine --lib collab::tests::measure -- --ignored --nocapture
       - name: Build and zip

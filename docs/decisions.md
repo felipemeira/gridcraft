@@ -59,9 +59,11 @@ texture handles instead of cycling through the cache every frame.
 
 ## Ctrl+wheel zoom steps along its own ladder, not Excel's 15-point steps
 
-A Ctrl+wheel notch moves the zoom to the next step on `grid::WHEEL_ZOOM_LADDER`: 10, 12, 15, 18,
-21, 25, 30, 35, 42, 50, 60, 70, 85, 100, 120, 140, 170, 200, 240, 280, 340, 400 (four steps per
-doubling, 17–25% apart). A step less than 5% away is skipped, except 100% and the 10% / 400%
+A Ctrl+wheel notch moves the zoom to the next step on `grid::WHEEL_ZOOM_LADDER`: 10, 15, 20, 25,
+30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 175, 200, 250, 300, 400 (Verto: 10 points
+apart from 50% to 150%; upstream had four steps per doubling, 17–25% apart, which grew too fast).
+In the browser each wheel event counts as one notch at most: Chrome sends a notch as 100 pixels
+and Firefox as 3 lines, which egui would read as 2.5 to 3 notches. A step less than 5% away is skipped, except 100% and the 10% / 400%
 limits, which are never skipped: 121% out goes to 100%, and 99% or 101% towards 100% goes to 100%.
 The wheel's turning is counted in notches (egui eases each notch in over several frames, and
 fine-grained wheels send parts of one); a notch steps once 60% of it has turned. With animations

@@ -63,16 +63,17 @@ fn number_format_colors_resolve_named_and_indexed_rgb() {
 #[test]
 fn wheel_zoom_steps_along_the_ladder_and_stops_at_100() {
     for (from, zoom_in, to) in [
-        (100, true, 120),
-        (120, false, 100),
-        (100, false, 85),
-        // Between steps, the next one each way (Excel: 112% goes to 115% or 100%).
+        (100, true, 110),
+        (110, false, 100),
+        (100, false, 90),
+        // Between steps, the next one each way (110% is less than 5% away, so out goes to 100%).
         (112, true, 120),
         (112, false, 100),
+        (117, false, 110),
         // A step less than 5% away is skipped…
-        (121, false, 100),
-        (86, false, 70),
-        (139, true, 170),
+        (121, false, 110),
+        (83, false, 70),
+        (139, true, 150),
         // …but never 100% or a limit.
         (99, true, 100),
         (101, false, 100),
@@ -82,18 +83,18 @@ fn wheel_zoom_steps_along_the_ladder_and_stops_at_100() {
         (400, true, 400),
         (10, false, 10),
         // Out-of-range zooms (from a file) come into range first.
-        (5, true, 12),
-        (1000, false, 340),
+        (5, true, 15),
+        (1000, false, 300),
         (0, false, 10),
         (u16::MAX, true, 400),
     ] {
         assert_eq!(wheel_zoom_step(from, zoom_in), to, "{from}% {}", if zoom_in { "in" } else { "out" });
     }
-    // Every step on the ladder is 15–25% from the next, and a notch in then out returns.
-    // (The glide between steps is `zoom_glide_moves_by_ratio_and_always_arrives`.)
+    // Every step on the ladder is 7–50% from the next (10 points near 100%), and a notch in then
+    // out returns. (The glide between steps is `zoom_glide_moves_by_ratio_and_always_arrives`.)
     for w in WHEEL_ZOOM_LADDER.windows(2) {
         let ratio = f32::from(w[1]) / f32::from(w[0]);
-        assert!((1.15..=1.25).contains(&ratio), "{w:?}");
+        assert!((1.07..=1.5).contains(&ratio), "{w:?}");
         assert_eq!(wheel_zoom_step(w[0], true), w[1]);
         assert_eq!(wheel_zoom_step(w[1], false), w[0]);
     }
