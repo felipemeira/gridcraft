@@ -511,6 +511,9 @@ mod lifecycle_tests {
         let ctx = egui::Context::default();
         let mut app = app();
         app.services.close_document = Some(Box::new(|| {}));
+        let handed = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let seen = handed.clone();
+        app.services.download = Some(Box::new(move |name: &str, _: &[u8]| seen.borrow_mut().push(name.to_string())));
         app.run("cell.set", serde_json::json!({"cell": "A1", "input": "42"})).unwrap();
         app.ui.autosave = true;
         app.session.active_mut().unwrap().title = "Medição.xlsx".into();
@@ -522,6 +525,8 @@ mod lifecycle_tests {
         app.session.read_only = false;
         let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| app.logic(ctx));
         assert!(app.grid.last_autosave > before, "AutoSave saved the host's workbook");
+        assert_eq!(handed.borrow().len(), 1, "the workbook went to the page in the same tick: {:?}", handed.borrow());
+        assert!(handed.borrow()[0].ends_with(".xlsx"), "{:?}", handed.borrow());
     }
 
     #[test]
