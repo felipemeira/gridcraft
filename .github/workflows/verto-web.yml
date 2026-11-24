@@ -59,6 +59,8 @@ jobs:
           cargo test --locked -p gridcraft-ui-egui --lib grid::tests
           cargo test --locked -p gridcraft-ui-egui --test it wheel_zoom
           cargo test --locked -p gridcraft-web --bin gridcraft-web prefs
+      - name: Test AutoSave inside Verto
+        run: cargo test --locked -p gridcraft-ui-egui --lib autosave_covers_a_host_workbook_by_name
       - name: Measure co-editing (sizes and times)
         run: cargo test --locked --release -p gridcraft-engine --lib collab::tests::measure -- --ignored --nocapture
       - name: Build and zip

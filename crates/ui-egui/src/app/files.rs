@@ -104,8 +104,18 @@ impl SheetApp {
     /// AutoSave: save workbooks that have a file shortly after they change. This decision lives in
     /// `logic` so a hidden or logic-only frame still saves; the monotonic timestamp check keeps a
     /// forced hidden UI pass from saving the same change twice.
+    /// Verto (host mode, [`crate::services::Services::close_document`]): the workbook came from the
+    /// page, with no path of its own; its Save hands the bytes back to the page, so AutoSave covers
+    /// it by name too, unless it is open only to read.
     pub(super) fn autosave(&mut self, ctx: &egui::Context) {
-        let dirty_xlsx = self.session.active().is_some_and(|d| d.is_dirty() && d.path.as_deref().is_some_and(|p| p.ends_with(".xlsx")));
+        let host = self.services.close_document.is_some() && !self.session.read_only;
+        let dirty_xlsx = self.session.active().is_some_and(|d| {
+            d.is_dirty()
+                && match d.path.as_deref() {
+                    Some(p) => p.ends_with(".xlsx"),
+                    None => host && d.display_title().to_ascii_lowercase().ends_with(".xlsx"),
+                }
+        });
         let now = crate::monotonic_ms();
         let autosave_due =
             self.ui.autosave && self.editor.is_none() && self.text_box_editor.is_none() && now - self.grid.last_autosave > 2000.0 && dirty_xlsx;

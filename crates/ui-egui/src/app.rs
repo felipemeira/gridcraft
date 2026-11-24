@@ -505,6 +505,26 @@ mod lifecycle_tests {
     }
 
     #[test]
+    /// Verto: the workbook the host page sent has no path; AutoSave saves it by name (Save hands
+    /// it to the page), but not while it is open only to read.
+    fn autosave_covers_a_host_workbook_by_name() {
+        let ctx = egui::Context::default();
+        let mut app = app();
+        app.services.close_document = Some(Box::new(|| {}));
+        app.run("cell.set", serde_json::json!({"cell": "A1", "input": "42"})).unwrap();
+        app.ui.autosave = true;
+        app.session.active_mut().unwrap().title = "Medição.xlsx".into();
+        let before = monotonic_ms() - 3000.0;
+        app.grid.last_autosave = before;
+        app.session.read_only = true;
+        let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| app.logic(ctx));
+        assert_eq!(app.grid.last_autosave, before, "open only to read: no AutoSave");
+        app.session.read_only = false;
+        let _ = ctx.run_logic(&egui::RawInput::default(), |ctx| app.logic(ctx));
+        assert!(app.grid.last_autosave > before, "AutoSave saved the host's workbook");
+    }
+
+    #[test]
     /// The title is sent on the first tick and after a rename, but not on every unchanged frame.
     fn a_logic_only_tick_updates_the_title_once_per_change() {
         let ctx = egui::Context::default();
